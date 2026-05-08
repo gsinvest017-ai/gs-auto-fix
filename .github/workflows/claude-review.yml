@@ -1,0 +1,36 @@
+name: Claude PR review
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize]
+
+jobs:
+  review:
+    # Skip drafts; review human and Claude-authored PRs alike.
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          prompt: |
+            Review pull request #${{ github.event.pull_request.number }} in ${{ github.repository }}.
+
+            Focus on:
+            - Correctness bugs and logic errors
+            - Security issues (injection, secret handling, auth)
+            - Obvious performance problems
+            - Missing or wrong tests
+
+            Skip style nits, formatting, and bikeshedding. If the PR looks fine, say so briefly.
+
+            Post a single PR review with `gh pr review ${{ github.event.pull_request.number }} --comment --body "..."`. Use inline comments only when the issue is tied to a specific line.
+          claude_args: '--allowed-tools "Bash(gh pr:*),Bash(gh api:*),Bash(git diff:*),Bash(git log:*),Read,Grep,Glob"'

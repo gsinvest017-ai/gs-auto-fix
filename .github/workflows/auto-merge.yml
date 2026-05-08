@@ -1,0 +1,25 @@
+name: Auto-merge
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, labeled]
+
+jobs:
+  enable-auto-merge:
+    # Enable GitHub's native auto-merge for PRs that come from the auto-fix
+    # flow: branches Claude opens (claude/*) or anything explicitly tagged
+    # `auto-merge`. Branch protection still gates the actual merge on CI green
+    # plus any required reviews.
+    if: |
+      startsWith(github.event.pull_request.head.ref, 'claude/') ||
+      contains(github.event.pull_request.labels.*.name, 'auto-merge')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: peter-evans/enable-pull-request-automerge@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          pull-request-number: ${{ github.event.pull_request.number }}
+          merge-method: squash

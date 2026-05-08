@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: pytest -v
+
+  open-issue-on-failure:
+    needs: test
+    # Only file an auto-fix issue when main itself breaks; PR failures are
+    # already visible on the PR and shouldn't spam the issue tracker.
+    if: failure() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const sha = context.sha.slice(0, 7);
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `CI failed on main @ ${sha}`,
+              body: [
+                `Tests failed on \`main\` at ${context.sha}.`,
+                ``,
+                `Failing run: ${runUrl}`,
+                ``,
+                `@claude please investigate the failing tests in the run above and open a PR that fixes them. Keep the change minimal and add/adjust tests where it makes the regression harder to reintroduce.`,
+              ].join('\n'),
+              labels: ['auto-fix', 'ci-failure'],
+            });
