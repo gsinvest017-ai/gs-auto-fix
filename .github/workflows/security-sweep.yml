@@ -1,0 +1,92 @@
+name: security-sweep
+
+# 把資安告警接進既有四段式 auto-fix loop —— 完全不改動 ci/claude-fix/review/
+# auto-merge 任何既有 workflow。本 workflow 只「開一張帶 auto-fix label 的 issue」，
+# 剩下的 claude-fix.yml → PR → review → merge 沿用既有 wiring。
+#
+# 觸發：每週掃一次 + 手動。彙整 open 的 code-scanning 與 Dependabot 告警成單一
+# issue（用 security-autofix label 去重，避免每輪洗版）。讀不到某類告警（沒開
+# code scanning / 沒 GHAS）一律 best-effort 略過，不讓 job 失敗。
+
+on:
+  schedule:
+    - cron: "30 19 * * 1"   # 每週一 03:30 (UTC+8)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: read
+  issues: write
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const DEDUP_LABEL = 'security-autofix';
+
+            async function safe(fn, label) {
+              try { return await fn(); }
+              catch (e) { core.info(`略過 ${label}：${e.status || ''} ${e.message}`); return []; }
+            }
+
+            // 1) code scanning（semgrep / gitleaks / CodeQL 推上去的）open 告警
+            const codeAlerts = await safe(() => github.paginate(
+              github.rest.codeScanning.listAlertsForRepo,
+              { owner, repo, state: 'open', per_page: 100 }
+            ), 'code-scanning');
+
+            // 2) Dependabot 依賴告警 open
+            const depAlerts = await safe(() => github.paginate(
+              github.rest.dependabot.listAlertsForRepo,
+              { owner, repo, state: 'open', per_page: 100 }
+            ), 'dependabot');
+
+            const total = codeAlerts.length + depAlerts.length;
+            if (total === 0) { core.info('沒有 open 的資安告警，結束。'); return; }
+
+            // 去重：已有同類 open issue 就不再開
+            const existing = await github.paginate(github.rest.issues.listForRepo,
+              { owner, repo, state: 'open', labels: DEDUP_LABEL, per_page: 100 });
+            if (existing.length > 0) {
+              core.info(`已有 open 的 ${DEDUP_LABEL} issue #${existing[0].number}，本輪略過。`);
+              return;
+            }
+
+            // 摘要（最多各列 15 筆，避免 issue body 過長）
+            const depLines = depAlerts.slice(0, 15).map(a => {
+              const d = a.security_advisory || {};
+              const pkg = a.dependency?.package?.name || '(unknown)';
+              return `- **${d.severity || '?'}** \`${pkg}\` — ${d.summary || d.ghsa_id || ''} (${a.html_url})`;
+            });
+            const codeLines = codeAlerts.slice(0, 15).map(a => {
+              const r = a.rule || {};
+              const loc = a.most_recent_instance?.location?.path || '';
+              return `- **${r.security_severity_level || r.severity || '?'}** ${r.id || r.name} — \`${loc}\` (${a.html_url})`;
+            });
+
+            const body = [
+              `自動資安巡掃發現 **${total}** 筆未處理告警（Dependabot ${depAlerts.length} + code-scanning ${codeAlerts.length}）。`,
+              ``,
+              depLines.length ? `### Dependabot 依賴漏洞\n${depLines.join('\n')}` : '',
+              codeLines.length ? `### Code scanning (semgrep / gitleaks / CodeQL)\n${codeLines.join('\n')}` : '',
+              ``,
+              `@claude 請逐筆評估上述資安告警並開 PR 修復：`,
+              `- 依賴漏洞：升到最低安全版本，盡量不破壞既有相容性；無法升版者在 PR 說明原因。`,
+              `- code scanning：修掉真正的漏洞；若為誤報，加上 inline 抑制註解並說明理由。`,
+              `- 維持最小變更，不要順手重構；改完跑測試確認綠燈。`,
+              ``,
+              `<sub>由 security-sweep.yml 自動建立；處理完關閉本 issue，下輪巡掃才會再開新的。</sub>`,
+            ].filter(Boolean).join('\n');
+
+            const issue = await github.rest.issues.create({
+              owner, repo,
+              title: `資安巡掃：${total} 筆待修告警`,
+              body,
+              labels: ['auto-fix', 'security', DEDUP_LABEL],
+            });
+            core.info(`已建立 issue #${issue.data.number}`);
