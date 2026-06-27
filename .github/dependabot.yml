@@ -1,0 +1,16 @@
+# Dependabot — 依賴 CVE 自動偵測 + 開 PR（不自動 merge，需人工/auto-fix 決定）。
+# 由 gs-harness rollout-security 依本 repo 實際存在的 manifest 生成。
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "security"]
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "security"]
