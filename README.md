@@ -32,6 +32,15 @@ flowchart TD
 
 也支援手動觸發：在任何 issue/PR 留言 `@claude ...`（須為 OWNER/MEMBER/COLLABORATOR），Claude 會接手處理。
 
+### 資安觸發來源（security-sweep.yml）
+
+除了「CI 紅燈」，loop 也能被**資安告警**驅動。`security-sweep.yml` 每週（+ 手動 `workflow_dispatch`）巡掃本 repo 的 open 告警：
+
+- **Dependabot** 依賴漏洞（`dependabot.listAlertsForRepo`）
+- **code scanning** 告警（semgrep / gitleaks / CodeQL 推上去的）
+
+有未處理告警時，開出一張帶 `auto-fix` label 的彙整 issue（`@claude` 請逐筆修復），接著沿用既有 `claude-fix → PR → review → auto-merge` 四段式，**不修改任何既有 workflow**。用 `security-autofix` label 去重，避免每輪洗版；讀不到某類告警（沒開 code scanning / 無 GHAS）一律 best-effort 略過。掃描器本身（gitleaks/semgrep/dependabot 設定）由 `gs-harness rollout-security` 佈署。
+
 ## 必備工具與帳號
 
 **本地端**
