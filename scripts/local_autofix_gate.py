@@ -9,6 +9,7 @@ implicated 的檔案；地端修好就回 exit 0，修不掉回 exit 2（由 wor
 from __future__ import annotations
 
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -19,7 +20,7 @@ VERIFY = "pytest -q"
 
 
 def run(cmd: str) -> tuple[bool, str]:
-    p = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    p = subprocess.run(shlex.split(cmd), capture_output=True, text=True)
     return p.returncode == 0, p.stdout + p.stderr
 
 
