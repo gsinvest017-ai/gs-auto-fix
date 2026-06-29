@@ -1,0 +1,73 @@
+# 地端先修 gate（PoC1，純附加，不改既有 claude-fix.yml）。
+#
+# 設計：用「新 label local-fix-first」當入口，避免與既有吃 auto-fix label 的雲端
+#       claude-fix.yml 同時觸發。地端 qwen3-coder 修好 → 開 claude/* PR（接既有
+#       auto-merge.yml）；修不掉 → 自動補 auto-fix label，升級到既有雲端流程。
+#
+# 前置：需註冊一台 self-hosted runner（label: self-hosted, gpu, ollama）且已備
+#       Ollama + qwen3-coder（即使用者的 RTX 5090 機）。未註冊前此 workflow 不會
+#       佔用任何資源（沒有 matching runner 就不會排程）。
+name: Claude local-first fix gate
+
+on:
+  issues:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: 手動測試用的 issue 編號
+        required: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  local-fix:
+    if: >
+      github.event_name == workflow_dispatch ||
+      (github.event_name == issues && github.event.label.name == local-fix-first)
+    runs-on: [self-hosted, gpu, ollama]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps + gs-agent-router
+        run: |
+          pip install -r requirements.txt
+          pip install "git+https://github.com/gsinvest017-ai/gs-agent-router.git"
+
+      - name: Local-first fix attempt (qwen3-coder)
+        id: gate
+        continue-on-error: true
+        run: python scripts/local_autofix_gate.py
+
+      - name: local solved -> open PR
+        if: steps.gate.outcome == success
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ github.event.issue.number || github.event.inputs.issue_number }}
+        run: |
+          BR="claude/local-fix-${ISSUE:-manual}-${{ github.run_id }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BR"
+          git add -A
+          git commit -m "fix: 地端 qwen3-coder 自動修復（issue #${ISSUE}），未動用雲端模型"
+          git push origin "$BR"
+          gh pr create --head "$BR" --base main \
+            --title "地端自動修復 #${ISSUE}" \
+            --body "由 gs-agent-router 地端模型（qwen3-coder）修復，未消耗雲端 token。Closes #${ISSUE}"
+
+      - name: local failed -> escalate to cloud
+        if: steps.gate.outcome == failure && github.event_name == issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue edit "${{ github.event.issue.number }}" --add-label auto-fix
+          gh issue comment "${{ github.event.issue.number }}" \
+            --body "地端模型連續修不掉，已補 auto-fix label 升級雲端高階模型處理。"
