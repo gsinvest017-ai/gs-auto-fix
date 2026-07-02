@@ -1,0 +1,82 @@
+# Spec 歸檔閉環（gs-spec-forge 整合）— 純附加、預設 inert。
+#
+# 目的：PR 合併後，把當初驅動這次開發的 spec 標記定版並歸檔（status→archived、bump、搬 archive/）。
+# 完成 brainstorm→spec→dev→CR→PR→CICD 的最後一段閉環。
+#
+# 安全設計（不干擾任何既有 workflow）：
+#   1. 這是**獨立新檔**，不改 auto-merge.yml / ci.yml / claude-*.yml 任何一行。
+#   2. **預設不動**：只有同時滿足「PR 已 merged」+「帶 `spec-archive` label」才執行；
+#      一般 PR（無此 label）完全跳過，對現行流程零影響。
+#   3. 未設定 vault 來源（secret SPEC_FORGE_VAULT_REPO）時 → 記 log 後跳過，**絕不 fail**
+#      （post-merge 執行，即使出錯也不影響已合併的 PR）。
+#
+# 待補的 wiring（由本 repo 維護者設定，非本檔可代勞）：
+#   - secret SPEC_FORGE_VAULT_REPO：存放 Obsidian vault 的 repo（owner/name）。
+#   - secret SPEC_FORGE_VAULT_TOKEN：可 checkout / push 該 vault repo 的 token。
+#   - PR body 需帶一行 `Spec: <vault 內的相對路徑>`（gs-spec-forge seed 產 PR 時附上）。
+
+name: Spec Archive
+
+on:
+  pull_request:
+    types: [closed]
+
+jobs:
+  archive-spec:
+    # 只在「已合併」且「明確標了 spec-archive label」時才跑 → 預設 inert。
+    if: >
+      github.event.pull_request.merged == true &&
+      contains(github.event.pull_request.labels.*.name, 'spec-archive')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: 檢查是否已設定 vault 來源（未設定則跳過，不 fail）
+        id: guard
+        env:
+          VAULT_REPO: ${{ secrets.SPEC_FORGE_VAULT_REPO }}
+        run: |
+          if [ -z "${VAULT_REPO}" ]; then
+            echo "SPEC_FORGE_VAULT_REPO 未設定 → 略過歸檔（尚未完成 wiring）。"
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: "解析 PR body 的 Spec: 路徑"
+        id: spec
+        if: steps.guard.outputs.configured == 'true'
+        env:
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          SPEC_PATH="$(printf '%s\n' "$BODY" | sed -n 's/^Spec:[[:space:]]*//p' | head -n1)"
+          if [ -z "${SPEC_PATH}" ]; then
+            echo "PR body 無 'Spec:' 標記 → 無可歸檔的 spec，略過。"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "path=${SPEC_PATH}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout vault
+        if: steps.spec.outputs.found == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SPEC_FORGE_VAULT_REPO }}
+          token: ${{ secrets.SPEC_FORGE_VAULT_TOKEN }}
+          path: vault-repo
+
+      - name: 安裝 gs-spec-forge 並歸檔
+        if: steps.spec.outputs.found == 'true'
+        env:
+          SPEC_PATH: ${{ steps.spec.outputs.path }}
+        run: |
+          python -m pip install --quiet "git+https://github.com/gsinvest017-ai/gs-spec-forge.git"
+          cd vault-repo
+          spec-forge archive "${SPEC_PATH}"
+          # 歸檔後把 vault 變更 commit 回 vault repo（git 歷史即定版紀錄）。
+          git config user.name  "spec-archive-bot"
+          git config user.email "spec-archive@users.noreply.github.com"
+          git add -A
+          git commit -m "chore: 歸檔已合併 PR #${{ github.event.pull_request.number }} 的 spec" || echo "無變更可 commit"
+          git push || echo "push 略過（權限 / 無變更）"
