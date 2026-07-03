@@ -45,8 +45,24 @@
 
 ### M3 — 端到端驗證（2026-07-03）
 
-- push 後用 `gh workflow run claude-fix-local.yml` 觸發（workflow_dispatch）
-- 結果見最終報告 / 下方補記
+用 `gh workflow run` 觸發（不開 issue，避免 escalate 誤觸雲端 claude-fix
+消耗 token），共跑 4 輪，撞到兩個 self-hosted Windows 特有的坑：
+
+1. **run 28640767924 ✗**：`actions/setup-python@v5` 在非管理員 runner 上
+   跑 Python installer 寫 HKLM registry 被拒 → 移除 setup-python，
+   改用機上 Python 建 per-run venv
+2. **run 28640947303 / 28641039628 ✗**：`shell: bash` 仍解析到 WindowsApps
+   的 WSL bash（吃掉反斜線路徑報 `C:actions-runner-gsautofix_work_temp...
+   No such file`）。**Windows runner 每個 job 會從 registry 重新生成 PATH**，
+   所以 runner 目錄 `.path` 檔與排程任務 wrapper 的 PATH 注入都攔不到
+   → 建 `C:\gitbash` junction（→ `C:\Program Files\Git`，避路徑空白），
+   workflow `defaults.run.shell` 釘死完整路徑
+3. **run 28641171093 ✓ 全綠**：checkout → venv → pip 裝依賴 +
+   gs-agent-router → gate 跑 pytest（綠）→ PR step 防呆正確輸出
+   「測試已綠且無檔案變更，跳過開 PR」→ escalate skipped
+
+尚未驗證「真實紅測試 → qwen3-coder 實際修復 → 開 PR」的完整鏈路
+（需要一個受控的壞 commit / issue，見後續）。
 
 ## Fallback 指引
 
@@ -66,5 +82,8 @@
 - gsinvest017-ai 是個人帳號，runner 無法跨 repo 共用；其他 repo 要 GPU CI
   需在同機各註冊一個 runner instance（建議之後開 gs-runner-fleet 收斂
   註冊腳本與 labels 慣例），GPU job 記得共用 `concurrency.group: rtx5090-gpu`
+- 尚未用「真實紅測試」驗證 qwen3-coder 修復 → 開 PR 的完整鏈路
+- 本次 workflow 修正是以 owner 身分直接 push main（bypass「須走 PR」
+  保護規則）；日後常規變更仍應走 PR
 - runner 監控尚未接 gs-obs-radar（offline 目前是靜默的）
 - Mac Studio（arm64）可另註冊補 macOS 測試，未做
