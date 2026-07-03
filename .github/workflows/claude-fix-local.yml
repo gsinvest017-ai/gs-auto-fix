@@ -44,9 +44,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+      # setup-python 在 self-hosted 非管理員 Windows 會跑 installer 寫 HKLM 被拒；
+      # 專用 runner 機上已有 Python，直接建 per-run venv。
+      - name: Set up venv（機上 Python，免 setup-python）
+        run: |
+          python -m venv .venv
+          echo "$(pwd -W)/.venv/Scripts" >> "$GITHUB_PATH"
 
       - name: Install deps + gs-agent-router
         run: |
