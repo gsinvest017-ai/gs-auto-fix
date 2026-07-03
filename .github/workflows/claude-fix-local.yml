@@ -29,11 +29,13 @@ concurrency:
   group: rtx5090-gpu
   cancel-in-progress: false
 
-# runner 是 Windows 機：步驟全用 bash 語法，統一指定 Git Bash
-# （runner 目錄已用 .path 把 Git\bin 排在 WSL bash 之前）。
+# runner 是 Windows 機：步驟全用 bash 語法。Windows runner 每個 job 會從
+# registry 重生 PATH，`shell: bash` 會解析到 WindowsApps 的 WSL bash（吃掉
+# 反斜線路徑）；因此把 shell 釘死成 Git Bash 完整路徑（C:\gitbash 是指向
+# C:\Program Files\Git 的 junction，避免路徑空白）。
 defaults:
   run:
-    shell: bash
+    shell: C:\gitbash\bin\bash.exe --noprofile --norc -e -o pipefail {0}
 
 jobs:
   local-fix:
