@@ -23,6 +23,18 @@ permissions:
   issues: write
   pull-requests: write
 
+# 同機只有一張 GPU（RTX 5090）：GPU job 一律序列化，避免與其他 repo 的
+# self-hosted job 同時搶卡。
+concurrency:
+  group: rtx5090-gpu
+  cancel-in-progress: false
+
+# runner 是 Windows 機：步驟全用 bash 語法，統一指定 Git Bash
+# （runner 目錄已用 .path 把 Git\bin 排在 WSL bash 之前）。
+defaults:
+  run:
+    shell: bash
+
 jobs:
   local-fix:
     if: >
@@ -52,6 +64,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ISSUE: ${{ github.event.issue.number || github.event.inputs.issue_number }}
         run: |
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "測試已綠且無檔案變更，跳過開 PR"
+            exit 0
+          fi
           BR="claude/local-fix-${ISSUE:-manual}-${{ github.run_id }}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
