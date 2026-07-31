@@ -48,20 +48,22 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          # 沒有 --allowed-tools 時，預設權限擋掉 git / gh，Claude 改得了檔卻推不了分支、
-          # 開不了 PR——action 仍回報 success（exit 0），只在 log 裡留
-          # permission_denials_count。實測一次 45 次 denial、60 turns、零產出。
-          # --max-turns 同時擋住被擋權限後的無效重試 churn。
-          # 白名單策略：**寬 allow + 明確 deny 破壞性動詞**（deny 優先於 allow）。
-          # 逐動詞列舉 git 會漏掉 fetch/rev-parse/config 等 plumbing（實測仍有 10 次
-          # denial 並跑滿 turn 上限），所以允許 `Bash(git:*)`，但把真正危險的動詞列進
-          # --disallowed-tools：本 job 帶 contents/issues/PR 寫入權，且 prompt 會讀 CI log
-          # （比 author_association 把關過的 issue 內容更不可信），要防的是 force-push /
-          # reset / clean / 改 remote / 動 secret 這類不可逆或提權操作，而非普通 git 讀寫。
+          # 白名單策略：**逐動詞 allow**（不用 `Bash(git:*)`），deny 只當第二層。
+          # 為什麼不能只靠 deny：deny 比對的是字面 Bash 指令字串，所以
+          #   * `Bash(python:*)` 可以 `python -c "import os;os.system('git reset --hard')"`
+          #     繞掉所有 deny —— 因此 python 收窄到只能跑 pytest；
+          #   * `git config core.hooksPath` / `git -c core.hooksPath=…` 會讓後續 git 操作
+          #     執行攻擊者放的 hook 腳本；
+          #   * `git fetch ext::sh -c '…'` 的 transport helper 直接執行任意指令。
+          # 以上三條都已從 allow 移除或明確 deny。本 job 帶 contents/issues/PR 寫入權，
+          # 且 prompt 會讀 CI log（比 author_association 把關過的內容更不可信），
+          # 所以爆炸半徑要壓到「改檔 + commit + push 分支 + 開 PR + 跑 pytest」為止。
+          # （--max-turns 也擋住權限被擋後的無效重試 churn。實測多行 block scalar 的
+          #   三個 flag 都會被正確解析。）
           claude_args: |
             --max-turns 50
-            --allowed-tools "Read,Glob,Grep,Edit,Write,MultiEdit,TodoWrite,Bash(git:*),Bash(gh pr:*),Bash(gh issue:*),Bash(gh run:*),Bash(python:*)"
-            --disallowed-tools "Bash(git push --force:*),Bash(git push -f:*),Bash(git reset:*),Bash(git clean:*),Bash(git rebase:*),Bash(git filter-branch:*),Bash(git remote set-url:*),Bash(gh api:*),Bash(gh secret:*),Bash(gh repo delete:*)"
+            --allowed-tools "Read,Glob,Grep,Edit,Write,MultiEdit,TodoWrite,Bash(git add:*),Bash(git commit:*),Bash(git checkout:*),Bash(git switch:*),Bash(git branch:*),Bash(git push:*),Bash(git diff:*),Bash(git log:*),Bash(git status:*),Bash(git show:*),Bash(git rev-parse:*),Bash(git ls-files:*),Bash(gh pr:*),Bash(gh issue:*),Bash(gh run:*),Bash(pytest:*),Bash(python -m pytest:*)"
+            --disallowed-tools "Bash(git push --force:*),Bash(git push -f:*),Bash(git reset:*),Bash(git clean:*),Bash(git rebase:*),Bash(git filter-branch:*),Bash(git config:*),Bash(git -c:*),Bash(git remote:*),Bash(git submodule:*),Bash(git fetch:*),Bash(gh api:*),Bash(gh secret:*),Bash(gh repo:*)"
           prompt: |
             An auto-fix request was filed in this repository (${{ github.repository }}). Read the triggering issue or comment, including any linked workflow run logs, and identify the root cause of the failure.
 
