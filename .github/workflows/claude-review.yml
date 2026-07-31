@@ -21,6 +21,10 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
+          # auto-fix loop 開的 PR 作者是 github-actions[bot]，預設會被
+          # 「Workflow initiated by non-human actor」擋掉——結果是**最需要被審的那些 PR
+          # （Claude 自己寫的）反而完全沒人審**。只放行 github-actions，不用 '*'。
+          allowed_bots: "github-actions"
           prompt: |
             Review pull request #${{ github.event.pull_request.number }} in ${{ github.repository }}.
 
