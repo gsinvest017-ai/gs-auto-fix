@@ -8,6 +8,12 @@ on:
   pull_request_review_comment:
     types: [created]
 
+# 帶 label 建立 issue 會**同時**觸發 opened 與 labeled 兩個事件，兩個 run 會並行搶同一張
+# issue（實測：一張 issue 跑出兩個 run、各燒一次額度）。同一張 issue 只留最後一個。
+concurrency:
+  group: claude-fix-${{ github.event.issue.number || github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   fix:
     # Trust model:
@@ -42,6 +48,20 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
+          # 沒有 --allowed-tools 時，預設權限擋掉 git / gh，Claude 改得了檔卻推不了分支、
+          # 開不了 PR——action 仍回報 success（exit 0），只在 log 裡留
+          # permission_denials_count。實測一次 45 次 denial、60 turns、零產出。
+          # --max-turns 同時擋住被擋權限後的無效重試 churn。
+          # 白名單策略：**寬 allow + 明確 deny 破壞性動詞**（deny 優先於 allow）。
+          # 逐動詞列舉 git 會漏掉 fetch/rev-parse/config 等 plumbing（實測仍有 10 次
+          # denial 並跑滿 turn 上限），所以允許 `Bash(git:*)`，但把真正危險的動詞列進
+          # --disallowed-tools：本 job 帶 contents/issues/PR 寫入權，且 prompt 會讀 CI log
+          # （比 author_association 把關過的 issue 內容更不可信），要防的是 force-push /
+          # reset / clean / 改 remote / 動 secret 這類不可逆或提權操作，而非普通 git 讀寫。
+          claude_args: |
+            --max-turns 50
+            --allowed-tools "Read,Glob,Grep,Edit,Write,MultiEdit,TodoWrite,Bash(git:*),Bash(gh pr:*),Bash(gh issue:*),Bash(gh run:*),Bash(python:*)"
+            --disallowed-tools "Bash(git push --force:*),Bash(git push -f:*),Bash(git reset:*),Bash(git clean:*),Bash(git rebase:*),Bash(git filter-branch:*),Bash(git remote set-url:*),Bash(gh api:*),Bash(gh secret:*),Bash(gh repo delete:*)"
           prompt: |
             An auto-fix request was filed in this repository (${{ github.repository }}). Read the triggering issue or comment, including any linked workflow run logs, and identify the root cause of the failure.
 
