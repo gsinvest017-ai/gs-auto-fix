@@ -1,0 +1,107 @@
+# GUI 驗證關卡 — 在真實桌面上確認 App 起得來。
+#
+# ## 為什麼雲端 runner 做不到這件事
+#
+# ubuntu-latest 沒有圖形環境；windows-latest 有 Windows API，但它是**服務身分**，
+# 落在非互動的 window station（Service-0x0-XXXX$），跟 SSH 進去看到的一樣——
+# Tk / WPF 視窗畫不出來、SendInput 送不到任何桌面。這不是權限問題，是 Session
+# 隔離的架構結果，沒有開關可以打勾。
+#
+# 所以「App 啟動就壞掉」這類回歸一行 traceback 都不會進 CI，只會在使用者
+# 早上打開 App 時發生。這個 job 就是補這一段。
+#
+# ## 為什麼 self-hosted runner 可以
+#
+# 本 repo 的 self-hosted runner 是用「排程工作 + AtLogOn + Interactive logon」
+# 註冊的（見 docs/progress-selfhosted-runner.md：服務安裝需提權而 shell 未提權，
+# 所以改走使用者登入排程任務）。它因此跑在使用者的互動 session 裡，
+# 摸得到真正的桌面——這和 gs-mac-agent-perms 的 broker 是同一個機制。
+#
+# ## 這個 job 預設不會擋任何人
+#
+# - 只在動到 UI 相關路徑時觸發
+# - 不在 branch protection 的必要檢查清單裡（除非你自己去加）
+# - 有 timeout，runner 離線時會失敗而不是無限排隊
+# - continue-on-error：這是新關卡，先讓它出聲音、不要一上線就擋 merge。
+#   觀察幾週確認不誤報之後，再把這行拿掉並列為必要檢查。
+
+name: GUI verify
+
+on:
+  pull_request:
+    paths:
+      # 只有動到會影響畫面的東西才跑。改 README 不需要開一台桌面。
+      - "desktop/**"
+      - "gui-verify/**"
+      - "src/**/ui/**"
+      - ".github/workflows/gui-verify.yml"
+  workflow_dispatch:
+    inputs:
+      node:
+        description: "目標節點的 ssh 別名"
+        required: false
+        default: "public-pc"
+
+jobs:
+  gui-verify:
+    # 必須是有互動桌面的機器。雲端 runner 一律不行（理由見檔頭）。
+    runs-on: [self-hosted, Windows]
+    timeout-minutes: 15
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 確認 gsagent 可用
+        shell: bash
+        run: |
+          if ! command -v gsagent >/dev/null 2>&1; then
+            echo "::warning::這台 runner 上找不到 gsagent。"
+            echo "GUI 驗證需要 gs-mac-agent-perms 的 broker："
+            echo "  https://github.com/gsinvest017-ai/gs-mac-agent-perms"
+            echo "裝好之後這個 job 才有意義。"
+            exit 1
+          fi
+          gsagent --endpoint
+
+      - name: 確認目標真的有互動桌面
+        shell: bash
+        env:
+          NODE: ${{ github.event.inputs.node || 'public-pc' }}
+        run: |
+          # 在鎖屏或沒人登入的機器上跑 GUI 驗證沒有意義——要能分辨
+          # 「App 壞了」與「這台機器現在沒有桌面可用」。
+          ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$NODE" "gsagent perms" > perms.json || {
+            echo "::warning::連不上 $NODE 的 broker"; exit 1; }
+          python - <<'PY'
+          import json, sys
+          p = json.load(open("perms.json", encoding="utf-8"))
+          print("session=%s station=%s interactive=%s locked=%s"
+                % (p.get("session_id"), p.get("window_station"),
+                   p.get("interactive"), p.get("locked")))
+          if not p.get("interactive") or p.get("locked"):
+              print("::warning::目標沒有可用的互動桌面，GUI 驗證跳過")
+              sys.exit(1)
+          PY
+
+      - name: 跑 GUI 驗證
+        shell: bash
+        env:
+          NODE: ${{ github.event.inputs.node || 'public-pc' }}
+        run: |
+          # 每個 repo 自己提供 gui-verify/run.py（介面見 gs-codex-auto-ai）。
+          # 沒有的話就明講不做，而不是假裝通過。
+          if [ ! -f gui-verify/run.py ]; then
+            echo "::notice::這個 repo 沒有 gui-verify/run.py，略過"
+            exit 0
+          fi
+          python gui-verify/run.py --node "$NODE" --repo-path "$(pwd)"
+
+      - name: 收截圖佐證
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gui-verify-screenshots
+          path: gui-verify/artifacts/
+          if-no-files-found: ignore
+          retention-days: 7
