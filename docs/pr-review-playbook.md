@@ -67,14 +67,51 @@ gh secret set CLAUDE_CODE_OAUTH_TOKEN -R <owner>/<repo>         # 貼上上一�
 
 本 workflow 的四道約束，缺一不可：
 
+有兩類攻擊面，要分開處理。
+
+### A. 執行 PR 的程式碼（RCE）
+
 | 約束 | 為什麼 |
 |------|--------|
 | `actions/checkout` 不帶 ref（只取 base） | 取 `head.sha` 就是把外人的 code 拉進特權 context |
-| diff 一律走 `gh pr diff`（API），不落地 | 不產生可被執行的檔案 |
+| diff 走 `gh pr diff` 存成純資料檔，不執行 | 不產生會被執行的東西 |
 | 不跑 PR 的 test / build / lint / 安裝依賴 | `pip install` 會執行 `setup.py`、npm 會跑 `postinstall`，都是任意程式碼執行 |
-| `--allowed-tools` 不含通用 `Bash` | 只開 `gh pr diff/view/comment/edit` 與唯讀的 Read/Grep/Glob |
 
 跑 PR 的程式碼是 **CI 的職責**。CI 用 `pull_request` 事件，在沒有 secret 的隔離沙箱裡跑，那才是安全的地方。
+
+### B. 間接 prompt injection（模型被 diff 誘導去濫用自己的工具）
+
+這是**不同的一類**，A 的四道約束一條都擋不到它。
+
+前提：這支 workflow 的存在意義就是審查來自 fork 的 PR，所以 **diff 是攻擊者 100% 可控的輸入**，
+而它被讀進一個握有 `pull-requests: write` token 的模型的 context。
+
+失敗的做法是給模型 `--allowed-tools "Bash(gh pr comment:*),Bash(gh pr edit:*)"`：
+
+- 那是**指令前綴比對，不是參數限制**。`gh pr edit <別的PR> --remove-label needs-work` 照樣通過。
+- 更糟：`gh pr comment $PR --body "$(env)"` 也通過比對，但 `$( )` 會在 shell 展開，
+  等於**把 `GH_TOKEN` 與 `CLAUDE_CODE_OAUTH_TOKEN` 貼成一則留言**。若 repo 是 public，
+  那就是長效憑證公開外洩。
+- 只靠 prompt 說「只能動這個 PR 編號」不是 ACL，是請求。
+
+現在的做法是**讓模型完全沒有 shell**：
+
+| 誰做 | 做什麼 |
+|------|--------|
+| workflow（固定邏輯） | 抓 diff 存成 `pr.diff`、`pr-meta.txt` |
+| 模型（`--allowed-tools "Read,Grep,Glob,Write"`） | 讀那兩個檔，把 review 寫進 `review-output.md`，最後一行給 `NEEDS_WORK: yes\|no` |
+| workflow（固定邏輯） | 讀 `review-output.md`、`gh pr comment --body-file`、依判定加 label |
+
+模型能影響的只剩「留言文字」與「一個 yes/no」，影響不到「對哪個 PR 動作」「用什麼參數」。
+留言用 `--body-file` 而非 `--body "..."`，內容不經 shell 展開。
+
+**殘留風險（已知並接受）**：注入仍可能讓模型給出錯誤的 `NEEDS_WORK` 判定，或在留言裡寫進誤導文字。
+前者用 **fail closed** 降低——判定行缺失或無法辨識時一律標 `needs-work`，所以「把判定行抹掉」
+的注入結果是被擋，不是被放行。後者只是文字，人看得到。
+
+這三段 shell 的行為由 `tests/test_pr_review_workflow.py` 覆蓋，該測試**直接從 YAML 抽出
+`run:` block 執行**，所以測試與實作不可能漂移；其中兩條是靜態不變式：模型不得有任何 `Bash`
+權限、留言必須走 `--body-file`。
 
 ---
 
@@ -101,8 +138,9 @@ Claude 發現 blocking 問題時執行 `gh pr edit --add-label needs-work`，
 | public / 付費 org（Team 以上） | **硬閘門** | ruleset 加 required status check，紅了就 merge 不了 |
 | Free 方案的 private repo | **軟閘門** | ruleset 設不了；紅燈 + label 只是自律護欄，擋不住有 write 權的人手動 merge |
 
-Free private repo 的缺口是**方案問題不是技術問題**，三條路寫在
-`gh-branch-guard/README.md`（搬到付費 org / 升級 org / 協作者降權走 fork-PR）。
+Free private repo 的缺口是**方案問題不是技術問題**，三條路是：搬到付費 org、升級 org 到 Team、
+或把協作者降權成 read 讓他們走 fork-PR。完整說明在本機工具 `gh-branch-guard` 的 README
+（`C:\Users\User\tools\gh-branch-guard\README.md`，不在本 repo 內）。
 
 ---
 
@@ -114,3 +152,7 @@ Free private repo 的缺口是**方案問題不是技術問題**，三條路寫�
   session 互搶。擴散到大量 repo 前先量測。
 - **`needs-work` label 可以被手動移除。** 這是刻意的——誤判時作者要有辦法繼續。
   代價是軟閘門更軟，硬閘門則不受影響（required check 會重跑）。
+- **⚠️ 沒設 secret 又把這個 job 設成 required check ＝ 零保護但看起來像有保護。**
+  缺 secret 時 review 乾淨跳過並回綠燈，git 歷史上會看到「每個 PR 都通過 review」，
+  但實際一次都沒跑過。設 required check 前先確認 secret 已存在：
+  `gh secret list -R <owner>/<repo> | grep CLAUDE_CODE_OAUTH_TOKEN`
