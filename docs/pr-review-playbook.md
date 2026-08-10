@@ -42,6 +42,19 @@ jobs:
 2. **釘 tag（`@v1`）不要用 `@main`**。否則改一次 prompt，所有 repo 的 review 行為當場全變。
 3. **`secrets: inherit`**，否則 `CLAUDE_CODE_OAUTH_TOKEN` 傳不進去。
 
+### secret 怎麼設
+
+**不要用 `~/.claude/.credentials.json` 裡的 token。** 那是 session access token，通常幾小時就過期，
+塞進 GitHub secret 會先能動、之後靜默壞掉。CI 要的是長效 token：
+
+```bash
+claude setup-token                                              # 互動式，產生長效 token
+gh secret set CLAUDE_CODE_OAUTH_TOKEN -R <owner>/<repo>         # 貼上上一步的輸出
+```
+
+**沒設也可以先合 workflow。** 缺 secret 時 review 會乾淨跳過（只留一則 warning annotation），
+不會製造紅燈；不需要 token 的 path guard 仍然照跑。補上 secret 後下一個 PR 就會生效。
+
 `gs-auto-fix` 是 public repo，所以 private repo（含跨 org）都呼叫得到。
 若哪天它變 private，這條路會直接斷——private repo 的 reusable workflow 只能被同 owner 的 repo 呼叫。
 
