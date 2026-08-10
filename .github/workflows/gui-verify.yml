@@ -17,6 +17,15 @@
 # 所以改走使用者登入排程任務）。它因此跑在使用者的互動 session 裡，
 # 摸得到真正的桌面——這和 gs-mac-agent-perms 的 broker 是同一個機制。
 #
+# ## 為什麼全部用 pwsh 而不是 bash
+#
+# **實測踩到**：這台 runner 的 PATH 上 `bash` 是 `C:\WINDOWS\system32\bash.EXE`，
+# 也就是 WSL bash。`shell: bash` 會把 job 腳本的 Windows 路徑丟給 WSL，
+# 反斜線被吃掉後變成 `C:actions-runner_work_temp....sh: No such file or directory`。
+# docs/progress-selfhosted-runner.md 記過同一個坑，當時的解法是在 runner 目錄放
+# `.path` 檔把 Git bash 排前面——但那是 runner 端的設定，會隨重裝而失效。
+# 這裡改成完全不依賴 runner 端設定：一律走 pwsh。
+#
 # ## 這個 job 預設不會擋任何人
 #
 # - 只在動到 UI 相關路徑時觸發
@@ -49,53 +58,54 @@ jobs:
     timeout-minutes: 15
     continue-on-error: true
 
+    env:
+      NODE: ${{ github.event.inputs.node || 'public-pc' }}
+
+    defaults:
+      run:
+        shell: pwsh
+
     steps:
       - uses: actions/checkout@v4
 
       - name: 確認 gsagent 可用
-        shell: bash
         run: |
-          if ! command -v gsagent >/dev/null 2>&1; then
-            echo "::warning::這台 runner 上找不到 gsagent。"
-            echo "GUI 驗證需要 gs-mac-agent-perms 的 broker："
-            echo "  https://github.com/gsinvest017-ai/gs-mac-agent-perms"
-            echo "裝好之後這個 job 才有意義。"
+          $gs = Get-Command gsagent -ErrorAction SilentlyContinue
+          if (-not $gs) {
+            Write-Host "::warning::這台 runner 上找不到 gsagent。"
+            Write-Host "GUI 驗證需要 gs-mac-agent-perms 的 broker："
+            Write-Host "  https://github.com/gsinvest017-ai/gs-mac-agent-perms"
             exit 1
-          fi
-          gsagent --endpoint
+          }
+          Write-Host "gsagent: $($gs.Source)"
 
       - name: 確認目標真的有互動桌面
-        shell: bash
-        env:
-          NODE: ${{ github.event.inputs.node || 'public-pc' }}
         run: |
           # 在鎖屏或沒人登入的機器上跑 GUI 驗證沒有意義——要能分辨
           # 「App 壞了」與「這台機器現在沒有桌面可用」。
-          ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$NODE" "gsagent perms" > perms.json || {
-            echo "::warning::連不上 $NODE 的 broker"; exit 1; }
-          python - <<'PY'
-          import json, sys
-          p = json.load(open("perms.json", encoding="utf-8"))
-          print("session=%s station=%s interactive=%s locked=%s"
-                % (p.get("session_id"), p.get("window_station"),
-                   p.get("interactive"), p.get("locked")))
-          if not p.get("interactive") or p.get("locked"):
-              print("::warning::目標沒有可用的互動桌面，GUI 驗證跳過")
-              sys.exit(1)
-          PY
+          # ssh 一定要帶 -n：否則它會等 stdin 的 EOF，在 runner 裡永遠等不到。
+          $raw = ssh -n -o BatchMode=yes -o ConnectTimeout=10 $env:NODE "gsagent perms" 2>&1 | Out-String
+          try { $p = $raw | ConvertFrom-Json } catch {
+            Write-Host "::warning::連不上 $env:NODE 的 broker：$($raw.Trim())"
+            exit 1
+          }
+          Write-Host ("session={0} station={1} interactive={2} locked={3}" -f `
+                      $p.session_id, $p.window_station, $p.interactive, $p.locked)
+          if (-not $p.interactive -or $p.locked) {
+            Write-Host "::warning::目標沒有可用的互動桌面，GUI 驗證跳過"
+            exit 1
+          }
 
       - name: 跑 GUI 驗證
-        shell: bash
-        env:
-          NODE: ${{ github.event.inputs.node || 'public-pc' }}
         run: |
           # 每個 repo 自己提供 gui-verify/run.py（介面見 gs-codex-auto-ai）。
           # 沒有的話就明講不做，而不是假裝通過。
-          if [ ! -f gui-verify/run.py ]; then
-            echo "::notice::這個 repo 沒有 gui-verify/run.py，略過"
+          if (-not (Test-Path "gui-verify/run.py")) {
+            Write-Host "::notice::這個 repo 沒有 gui-verify/run.py，略過"
             exit 0
-          fi
-          python gui-verify/run.py --node "$NODE" --repo-path "$(pwd)"
+          }
+          python gui-verify/run.py --node $env:NODE --repo-path (Get-Location).Path
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: 收截圖佐證
         if: always()
