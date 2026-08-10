@@ -1,0 +1,183 @@
+name: Reusable teaching-mode PR review
+
+# 給「協作者多數沒受過正式程式訓練」的 repo 用的 PR review + 軟閘門。
+#
+# 為什麼是 workflow_call 而不是各 repo 各寫一份：
+#   review prompt 是會反覆調的東西。散在 N 個 repo 就等於 N 份會漂移的副本。
+#   本檔是唯一真相來源，各 repo 只放三行 caller stub 並釘 tag。
+#
+# ⚠️ 呼叫端必須用 `on: pull_request_target`，不能用 `pull_request`。
+#   來自 fork 的 pull_request 事件拿不到 repo secrets、GITHUB_TOKEN 也是唯讀的
+#   ——而「唯讀協作者從 fork 發的 PR」正是最需要被 review 的那一批。
+#
+# ⚠️ pull_request_target 在 base repo 的 context 執行，握有 secret 與寫入權。
+#   因此本 workflow **絕不 checkout、絕不執行 PR 的程式碼**：
+#     - checkout 只取 base 分支（可信）
+#     - diff 一律經 `gh pr diff` 走 API 取得，不落地成可執行檔
+#     - allowed-tools 不含通用 Bash，只開白名單內的 gh / 唯讀檔案工具
+#   跑 PR 的程式碼是 CI 的職責，CI 用 `pull_request` 事件在隔離沙箱裡跑。
+
+on:
+  workflow_call:
+    inputs:
+      project_context:
+        description: 一兩句話說明這個 repo 在做什麼，讓 review 有背景知識
+        required: false
+        type: string
+        default: ""
+      guard_paths:
+        description: |
+          禁止出現在 diff 裡的路徑 regex，一行一條。
+          命中就直接擋下並且**不呼叫 LLM**（避免把敏感內容送出去）。
+          例：含真實個資的 fixtures/、reports/、*.db
+        required: false
+        type: string
+        default: ""
+      guard_reason:
+        description: guard 命中時要告訴作者的原因
+        required: false
+        type: string
+        default: 這些路徑被列為禁止進版控的敏感資料。
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+
+jobs:
+  review:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PR: ${{ github.event.pull_request.number }}
+    steps:
+      # base 分支，不是 PR 的 code。給 review 讀 AGENTS.md / 既有原始碼當背景。
+      - uses: actions/checkout@v4
+
+      - name: 準備 needs-work label
+        run: |
+          gh label create needs-work \
+            --color D93F0B \
+            --description "AI review 發現需要先修正的問題" \
+            2>/dev/null || true
+          # 每次重跑都先清掉：否則上一輪貼的 label 會在作者修好後永遠卡著紅燈。
+          gh pr edit "$PR" --remove-label needs-work 2>/dev/null || true
+
+      # 確定性閘門：先用純 shell 判掉能判的，判不了的才丟給 LLM。
+      # 這一步刻意在 review 之前，命中時直接結束、一個 token 都不花。
+      - name: 敏感路徑檢查
+        if: inputs.guard_paths != ''
+        env:
+          # 走 env 而不是把 ${{ }} 直接內插進 shell：input 內含引號時不會打壞語法，
+          # 也不會讓 input 的內容變成可執行的 shell 片段。
+          GUARD_PATHS: ${{ inputs.guard_paths }}
+          GUARD_REASON: ${{ inputs.guard_reason }}
+        run: |
+          set -euo pipefail
+          files=$(gh pr diff "$PR" --name-only)
+          hits=""
+          while IFS= read -r pat; do
+            [ -z "$pat" ] && continue
+            m=$(printf '%s\n' "$files" | grep -E -- "$pat" || true)
+            if [ -n "$m" ]; then
+              hits=$(printf '%s\n%s' "$hits" "$m")
+            fi
+          done <<< "$GUARD_PATHS"
+
+          if [ -z "$(printf '%s' "$hits" | tr -d '[:space:]')" ]; then
+            echo "敏感路徑檢查通過"
+            exit 0
+          fi
+
+          gh pr edit "$PR" --add-label needs-work
+          {
+            echo '## ⛔ 這個 PR 動到了不該進版控的檔案'
+            echo
+            echo "$GUARD_REASON"
+            echo
+            echo '```'
+            printf '%s\n' "$hits" | sed '/^[[:space:]]*$/d'
+            echo '```'
+            echo
+            echo '**請這樣處理**（在你的分支上跑）：'
+            echo
+            echo '```bash'
+            echo 'git rm --cached <上面列出的檔案>'
+            echo 'git commit -m "移除誤入版控的敏感檔案"'
+            echo 'git push'
+            echo '```'
+            echo
+            echo '如果這些檔案已經被 push 過，光是從版控刪掉還不夠——git 歷史裡還留著，請直接找 Kevin 處理。'
+            echo
+            echo '> 為了避免把內容外送，這次 **沒有** 執行 AI review。修好後這則檢查會自動重跑。'
+          } > guard-comment.md
+          gh pr comment "$PR" --body-file guard-comment.md
+          echo "::error::diff 觸及敏感路徑，已中止 review"
+          exit 1
+
+      - name: Claude review（教學語氣）
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          allowed_bots: "github-actions"
+          prompt: |
+            你正在審查 ${{ github.repository }} 的 PR #${{ github.event.pull_request.number }}。
+
+            ${{ inputs.project_context }}
+
+            **這個 repo 的協作者多數沒有受過正式程式訓練。** 你的回應要讓他們看得懂、能照做，
+            而不是讓他們知道你懂很多。
+
+            做法：
+            - 先讀 repo 根目錄的 AGENTS.md / CLAUDE.md / README.md（若存在），以那份的工程慣例為準。
+            - 用 `gh pr diff ${{ github.event.pull_request.number }}` 取得完整 diff。
+            - **不要執行 PR 裡的任何程式碼、腳本或設定檔。** 你只讀，不跑。
+
+            用 `gh pr comment ${{ github.event.pull_request.number }} --body "..."` 貼一則留言，
+            全文繁體中文，結構如下：
+
+            ## 這個 PR 做了什麼
+            兩三句白話說明改動的目的與影響範圍。作者常常沒寫描述，這段幫他補上。
+
+            ## 需要修正
+            **只有這三類才能放進來：**
+            1. 安全問題 — 祕密外洩、注入、權限錯誤、把個資或憑證寫進版控
+            2. 正確性錯誤 — 邏輯錯、會噴例外、資料算錯、邊界條件沒處理
+            3. 破壞既有行為 — 改壞現有功能，或改了行為但測試沒跟著改
+
+            每一項的寫法固定是三段：
+            **問題是什麼** → **為什麼會出事**（講實際後果，不要只丟術語）→ **怎麼改**（給可以直接複製貼上的程式碼）
+            並標出 `檔名:行號`。
+
+            沒有就寫「沒有需要修正的問題 ✅」。不要為了看起來認真而硬湊。
+
+            ## 建議
+            命名、結構、效能、可讀性放這裡，**最多三項**，語氣是建議不是要求。
+            不要挑格式、縮排、引號、空行、import 排序這類 formatter 會處理的東西。
+
+            ## 結論
+            - 若「需要修正」有任何一項 → 寫「這個 PR 先不要合，請先處理上面的修正項目」，
+              然後執行 `gh pr edit ${{ github.event.pull_request.number }} --add-label needs-work`
+            - 若沒有 → 寫「這個 PR 沒問題，可以合 ✅」，**不要**加任何 label
+
+            語氣要求：直接、具體、不說教。作者是同事不是學生，不要出現「你應該學會…」這種句子。
+            不確定的地方就說不確定，不要編。
+          claude_args: >-
+            --allowed-tools "Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr comment:*),Bash(gh pr edit:*),Read,Grep,Glob"
+
+      # 軟閘門。label 是 Claude 上一步加的，這裡把它翻譯成 status check 的紅/綠。
+      # 在能設 ruleset 的 repo（public 或付費 org）把這個 job 設成 required check，
+      # 就從「自律護欄」升級成真正擋得住 merge 的硬閘門。
+      - name: 閘門判定
+        if: always()
+        run: |
+          labels=$(gh pr view "$PR" --json labels --jq '.labels[].name')
+          if printf '%s\n' "$labels" | grep -qx 'needs-work'; then
+            echo "::error::review 判定需要修正（needs-work），閘門擋下"
+            exit 1
+          fi
+          echo "閘門通過"
