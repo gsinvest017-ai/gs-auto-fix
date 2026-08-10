@@ -28,19 +28,35 @@ on:
 
 jobs:
   review:
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
     uses: gsinvest017-ai/gs-auto-fix/.github/workflows/_reusable-pr-review.yml@v1
     secrets: inherit
     with:
       project_context: 這個 repo 在做 XXX。
 ```
 
-三件事不能省：
+四件事不能省：
 
 1. **事件必須是 `pull_request_target`**。用 `pull_request` 的話，來自 fork 的 PR 拿不到
    `CLAUDE_CODE_OAUTH_TOKEN`（GitHub 不對 fork 注入 secret），而唯讀協作者只能走 fork——
    結果就是最該被 review 的 PR 完全跑不到。
 2. **釘 tag（`@v1`）不要用 `@main`**。否則改一次 prompt，所有 repo 的 review 行為當場全變。
 3. **`secrets: inherit`**，否則 `CLAUDE_CODE_OAUTH_TOKEN` 傳不進去。
+4. **`permissions:` 一定要寫在呼叫端。** 被呼叫的 reusable workflow 拿到的權限**不能超過
+   呼叫端 token 的上限**。多數 repo 的 `Settings → Actions → Workflow permissions` 是預設的
+   `read`，這時 reusable workflow 要求的 `pull-requests: write` 會讓整個 run 變成
+   **`startup_failure`——沒有 job、沒有 log、UI 上完全看不出原因**。在呼叫端明確宣告會蓋過
+   repo 預設值，爆炸半徑也比去 settings 開全域 write 小。
+
+   查目前設定：
+   ```bash
+   gh api repos/<owner>/<repo>/actions/permissions/workflow
+   ```
+   `gs-auto-fix` 自己是 `write`，所以**在它身上測不出這個問題**——三個 pilot repo 全是 `read`，
+   是在真實 PR 上才踩出來的。
 
 ### secret 怎麼設
 
