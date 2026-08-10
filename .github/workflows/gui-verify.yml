@@ -17,14 +17,16 @@
 # 所以改走使用者登入排程任務）。它因此跑在使用者的互動 session 裡，
 # 摸得到真正的桌面——這和 gs-mac-agent-perms 的 broker 是同一個機制。
 #
-# ## 為什麼全部用 pwsh 而不是 bash
+# ## 為什麼全部用 pwsh -NoProfile 而不是 bash
 #
 # **實測踩到**：這台 runner 的 PATH 上 `bash` 是 `C:\WINDOWS\system32\bash.EXE`，
 # 也就是 WSL bash。`shell: bash` 會把 job 腳本的 Windows 路徑丟給 WSL，
 # 反斜線被吃掉後變成 `C:actions-runner_work_temp....sh: No such file or directory`。
 # docs/progress-selfhosted-runner.md 記過同一個坑，當時的解法是在 runner 目錄放
 # `.path` 檔把 Git bash 排前面——但那是 runner 端的設定，會隨重裝而失效。
-# 這裡改成完全不依賴 runner 端設定：一律走 pwsh。
+# 這裡改成完全不依賴 runner 端設定：一律走 pwsh，而且**一定要 -NoProfile**——
+# 實測這台 runner 的 pwsh 設定檔有 pwsh-idle-arcade（閒置跳小遊戲），
+# 不帶 -NoProfile 會讓 job 卡死在 shell 啟動。同一類問題：使用者環境漏進 CI。
 #
 # ## 這個 job 預設不會擋任何人
 #
@@ -63,7 +65,12 @@ jobs:
 
     defaults:
       run:
-        shell: pwsh
+        # **一定要 -NoProfile**：GitHub Actions 的 `shell: pwsh` 會載入使用者設定檔，
+        # 而這台 runner 是開發機，設定檔裡有 pwsh-idle-arcade（閒置時跳 TUI 小遊戲）。
+        # 實測 job 會卡死在 shell 啟動，連第一個步驟都跑不完。
+        # 這和「PATH 上的 bash 是 WSL bash」是同一類問題：runner 的互動使用者環境
+        # 漏進 CI。自訂 shell 字串是唯一能把 -NoProfile 塞進去的方法。
+        shell: pwsh -NoProfile -Command "& '{0}'"
 
     steps:
       - uses: actions/checkout@v4
