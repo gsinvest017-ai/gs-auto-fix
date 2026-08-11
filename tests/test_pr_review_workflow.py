@@ -29,6 +29,7 @@ WORKFLOW = (
 )
 
 GUARD_STEP = "敏感路徑檢查"
+PRECHECK_STEP = "決定是否執行 AI review"
 VERDICT_STEP = "貼出 review 並套用閘門判定"
 
 GUARD_104 = "\n".join([r"^fixtures/.*\.json$", "^reports/", r"\.db$", r"\.sqlite3?$"])
@@ -181,6 +182,74 @@ def test_guard_comment_lists_every_hit(tmp_path):
     body = (tmp_path / "guard-comment.md").read_text(encoding="utf-8")
     assert "reports/a.md" in body and "fixtures/x.json" in body
     assert "keep.py" not in body, "沒命中的檔案不該出現在擋下留言裡"
+
+
+# ------------------------------------------------------------- precheck
+
+
+def _precheck(tmp_path: Path, author: str, author_type: str, token: str) -> dict[str, str]:
+    """跑 precheck step，回傳它寫進 $GITHUB_OUTPUT 的 key/value。"""
+    out = tmp_path / "gh-output.txt"
+    out.write_text("", encoding="utf-8")
+    res = _run(
+        _step_script(PRECHECK_STEP),
+        tmp_path,
+        _fake_gh(tmp_path),
+        {
+            "GITHUB_OUTPUT": out.as_posix(),
+            "PR_AUTHOR": author,
+            "PR_AUTHOR_TYPE": author_type,
+            "TOKEN": token,
+        },
+    )
+    assert res.returncode == 0, f"precheck 不該非零離開: {res.stderr}"
+    parsed = dict(
+        line.split("=", 1) for line in out.read_text(encoding="utf-8").splitlines() if line
+    )
+    return {**parsed, "_stdout": res.stdout}
+
+
+@pytest.mark.parametrize(
+    "author, author_type, skip, why",
+    [
+        ("gsinvest017-ai", "User", False, "人類的 PR 照常 review"),
+        ("github-actions[bot]", "Bot", False, "auto-fix loop 自己開的 PR 最需要被審"),
+        ("dependabot[bot]", "Bot", True, "dependabot：allowed_bots 沒放行，會紅燈"),
+        ("renovate[bot]", "Bot", True, "白名單而非黑名單——沒列名的 bot 預設跳過"),
+    ],
+)
+def test_precheck_only_reviews_humans_and_github_actions(
+    tmp_path, author, author_type, skip, why
+):
+    """機器人的 PR 必須在呼叫 action 之前就跳過。
+
+    沒擋掉的話 claude-code-action 會以「Workflow initiated by non-human actor」
+    exit 1，變成一個 PR 作者無從處理的紅燈——實例見 PR #18 / run 30699145258。
+    """
+    assert _precheck(tmp_path, author, author_type, "tok")["skip"] == str(skip).lower(), why
+
+
+def test_precheck_skips_cleanly_without_token(tmp_path):
+    """缺 secret 要乾淨跳過，不是讓整個 job 紅掉。"""
+    result = _precheck(tmp_path, "gsinvest017-ai", "User", "")
+    assert result["skip"] == "true"
+    assert "CLAUDE_CODE_OAUTH_TOKEN" in result["_stdout"], "要留下告訴 repo 主人怎麼補的訊息"
+
+
+def test_precheck_allowlist_matches_action_allowed_bots():
+    """precheck 放行的 bot 必須也在 action 的 allowed_bots 裡，否則照樣紅燈。
+
+    這兩份名單分屬不同檔案區塊，很容易只改一邊。
+    """
+    doc = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    script = _step_script(PRECHECK_STEP)
+    for step in doc["jobs"]["review"]["steps"]:
+        if step.get("uses", "").startswith("anthropics/claude-code-action"):
+            allowed = step["with"]["allowed_bots"]
+            assert "github-actions" in allowed
+            assert "github-actions[bot]" in script, "precheck 放行的 bot 與 allowed_bots 不一致"
+            return
+    raise AssertionError("找不到 claude-code-action step")
 
 
 # -------------------------------------------------------------- verdict
