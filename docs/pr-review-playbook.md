@@ -158,6 +158,28 @@ Free private repo 的缺口是**方案問題不是技術問題**，三條路是�
 或把協作者降權成 read 讓他們走 fork-PR。完整說明在本機工具 `gh-branch-guard` 的 README
 （`C:\Users\User\tools\gh-branch-guard\README.md`，不在本 repo 內）。
 
+### ⚠️ 在有既有 open PR 的 repo 上加 required status check
+
+required check 是**回溯生效**的：加下去的那一刻，所有既有 open PR 立刻變成 `BLOCKED`，
+因為它們身上沒有那個 check，而且**永遠不會自己長出來**。
+
+**`gh pr close` + `gh pr reopen` 不夠。** `reopened` 確實會觸發事件，但
+`pull_request` 用的是 **PR 分支自己**的 workflow 定義——分支建立在 `ci.yml` 之前的話，
+分支裡根本沒有那支檔案，CI 無從跑起。（`pull_request_target` 讀 base，所以 AI review
+會跑，看起來「有動」但 required 的那個 check 依然缺席，很容易誤判成已經解決。）
+
+正解是讓分支**實際含有** CI workflow，也就是把 base 併進 head：
+
+```bash
+gh pr update-branch <n> -R <owner>/<repo>
+```
+
+非破壞性（產生 merge commit，不 force-push、不改寫歷史），且會觸發 `synchronize`，
+CI 與 AI review 都會跑。
+
+順序建議：**先把 CI 合進預設分支並確認既有 PR 都 `update-branch` 過，再設 required check。**
+反過來做就會像這次一樣，一次卡住四個別人正在進行的 PR。
+
 ---
 
 ## 已知限制
