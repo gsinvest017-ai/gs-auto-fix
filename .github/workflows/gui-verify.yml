@@ -1,0 +1,124 @@
+# GUI 驗證關卡 — 在真實桌面上確認 App 起得來。
+#
+# ## 為什麼雲端 runner 做不到這件事
+#
+# ubuntu-latest 沒有圖形環境；windows-latest 有 Windows API，但它是**服務身分**，
+# 落在非互動的 window station（Service-0x0-XXXX$），跟 SSH 進去看到的一樣——
+# Tk / WPF 視窗畫不出來、SendInput 送不到任何桌面。這不是權限問題，是 Session
+# 隔離的架構結果，沒有開關可以打勾。
+#
+# 所以「App 啟動就壞掉」這類回歸一行 traceback 都不會進 CI，只會在使用者
+# 早上打開 App 時發生。這個 job 就是補這一段。
+#
+# ## 為什麼 self-hosted runner 可以
+#
+# 本 repo 的 self-hosted runner 是用「排程工作 + AtLogOn + Interactive logon」
+# 註冊的（見 docs/progress-selfhosted-runner.md：服務安裝需提權而 shell 未提權，
+# 所以改走使用者登入排程任務）。它因此跑在使用者的互動 session 裡，
+# 摸得到真正的桌面——這和 gs-mac-agent-perms 的 broker 是同一個機制。
+#
+# ## 為什麼全部用 pwsh -NoProfile 而不是 bash
+#
+# **實測踩到**：這台 runner 的 PATH 上 `bash` 是 `C:\WINDOWS\system32\bash.EXE`，
+# 也就是 WSL bash。`shell: bash` 會把 job 腳本的 Windows 路徑丟給 WSL，
+# 反斜線被吃掉後變成 `C:actions-runner_work_temp....sh: No such file or directory`。
+# docs/progress-selfhosted-runner.md 記過同一個坑，當時的解法是在 runner 目錄放
+# `.path` 檔把 Git bash 排前面——但那是 runner 端的設定，會隨重裝而失效。
+# 這裡改成完全不依賴 runner 端設定：一律走 pwsh，而且**一定要 -NoProfile**——
+# 實測這台 runner 的 pwsh 設定檔有 pwsh-idle-arcade（閒置跳小遊戲），
+# 不帶 -NoProfile 會讓 job 卡死在 shell 啟動。同一類問題：使用者環境漏進 CI。
+#
+# ## 這個 job 預設不會擋任何人
+#
+# - 只在動到 UI 相關路徑時觸發
+# - 不在 branch protection 的必要檢查清單裡（除非你自己去加）
+# - 有 timeout，runner 離線時會失敗而不是無限排隊
+# - continue-on-error：這是新關卡，先讓它出聲音、不要一上線就擋 merge。
+#   觀察幾週確認不誤報之後，再把這行拿掉並列為必要檢查。
+
+name: GUI verify
+
+on:
+  pull_request:
+    paths:
+      # 只有動到會影響畫面的東西才跑。改 README 不需要開一台桌面。
+      - "desktop/**"
+      - "gui-verify/**"
+      - "src/**/ui/**"
+      - ".github/workflows/gui-verify.yml"
+  workflow_dispatch:
+    inputs:
+      node:
+        description: "目標節點的 ssh 別名"
+        required: false
+        default: "public-pc"
+
+jobs:
+  gui-verify:
+    # 必須是有互動桌面的機器。雲端 runner 一律不行（理由見檔頭）。
+    runs-on: [self-hosted, Windows]
+    timeout-minutes: 15
+    continue-on-error: true
+
+    env:
+      NODE: ${{ github.event.inputs.node || 'public-pc' }}
+
+    defaults:
+      run:
+        # **一定要 -NoProfile**：GitHub Actions 的 `shell: pwsh` 會載入使用者設定檔，
+        # 而這台 runner 是開發機，設定檔裡有 pwsh-idle-arcade（閒置時跳 TUI 小遊戲）。
+        # 實測 job 會卡死在 shell 啟動，連第一個步驟都跑不完。
+        # 這和「PATH 上的 bash 是 WSL bash」是同一類問題：runner 的互動使用者環境
+        # 漏進 CI。自訂 shell 字串是唯一能把 -NoProfile 塞進去的方法。
+        shell: pwsh -NoProfile -Command "& '{0}'"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 確認 gsagent 可用
+        run: |
+          $gs = Get-Command gsagent -ErrorAction SilentlyContinue
+          if (-not $gs) {
+            Write-Host "::warning::這台 runner 上找不到 gsagent。"
+            Write-Host "GUI 驗證需要 gs-mac-agent-perms 的 broker："
+            Write-Host "  https://github.com/gsinvest017-ai/gs-mac-agent-perms"
+            exit 1
+          }
+          Write-Host "gsagent: $($gs.Source)"
+
+      - name: 確認目標真的有互動桌面
+        run: |
+          # 在鎖屏或沒人登入的機器上跑 GUI 驗證沒有意義——要能分辨
+          # 「App 壞了」與「這台機器現在沒有桌面可用」。
+          # ssh 一定要帶 -n：否則它會等 stdin 的 EOF，在 runner 裡永遠等不到。
+          $raw = ssh -n -o BatchMode=yes -o ConnectTimeout=10 $env:NODE "gsagent perms" 2>&1 | Out-String
+          try { $p = $raw | ConvertFrom-Json } catch {
+            Write-Host "::warning::連不上 $env:NODE 的 broker：$($raw.Trim())"
+            exit 1
+          }
+          Write-Host ("session={0} station={1} interactive={2} locked={3}" -f `
+                      $p.session_id, $p.window_station, $p.interactive, $p.locked)
+          if (-not $p.interactive -or $p.locked) {
+            Write-Host "::warning::目標沒有可用的互動桌面，GUI 驗證跳過"
+            exit 1
+          }
+
+      - name: 跑 GUI 驗證
+        run: |
+          # 每個 repo 自己提供 gui-verify/run.py（介面見 gs-codex-auto-ai）。
+          # 沒有的話就明講不做，而不是假裝通過。
+          if (-not (Test-Path "gui-verify/run.py")) {
+            Write-Host "::notice::這個 repo 沒有 gui-verify/run.py，略過"
+            exit 0
+          }
+          python gui-verify/run.py --node $env:NODE --repo-path (Get-Location).Path
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: 收截圖佐證
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gui-verify-screenshots
+          path: gui-verify/artifacts/
+          if-no-files-found: ignore
+          retention-days: 7
