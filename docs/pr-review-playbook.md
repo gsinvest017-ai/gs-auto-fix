@@ -168,6 +168,11 @@ Free private repo 的缺口是**方案問題不是技術問題**，三條路是�
   session 互搶。擴散到大量 repo 前先量測。
 - **`needs-work` label 可以被手動移除。** 這是刻意的——誤判時作者要有辦法繼續。
   代價是軟閘門更軟，硬閘門則不受影響（required check 會重跑）。
+- **機器人開的 PR 不會被 review**（`github-actions[bot]` 除外）。dependabot / renovate 的版本
+  bump 一律跳過，由 CI 與安全掃描把關。這是**白名單**：新接進來的 bot 預設不 review，
+  要放行得同時改 `precheck` 的判斷與 action 的 `allowed_bots`——兩邊不一致就會紅燈，
+  `test_precheck_allowlist_matches_action_allowed_bots` 會擋住只改一邊的情況。
+  背景見 `docs/progress-bot-pr-review-gate.md`。
 - **⚠️ 沒設 secret 又把這個 job 設成 required check ＝ 零保護但看起來像有保護。**
   缺 secret 時 review 乾淨跳過並回綠燈，git 歷史上會看到「每個 PR 都通過 review」，
   但實際一次都沒跑過。設 required check 前先確認 secret 已存在：

@@ -7,7 +7,23 @@ on:
 jobs:
   review:
     # Skip drafts; review human and Claude-authored PRs alike.
-    if: github.event.pull_request.draft == false
+    #
+    # 其他 bot（dependabot、未來的 renovate…）一律跳過。dependabot 的 PR 有兩道關卡疊在一起，
+    # 兩道都不是這裡放行就能解的（實證：run 30699145258，PR #18）：
+    #   1. claude-code-action 的 allowed_bots 沒放行 dependabot，直接
+    #      「Workflow initiated by non-human actor」exit 1。
+    #   2. 就算放行也一樣跑不動——dependabot 觸發的 `pull_request` run 拿不到 Actions secrets，
+    #      該次 log 裡 `CLAUDE_CODE_OAUTH_TOKEN` 是空字串（repo 明明設了這個 secret）。
+    # 要讓它真的跑起來，得把 token 另外設成 Dependabot secret。但 dependabot 改的正是
+    # `.github/workflows/*.yml`，那等於把 token 交給一個有權改 workflow 的來源——這個洞
+    # GitHub 本來就是刻意堵上的。版本 bump 交給 ci / semgrep / secret-scan 把關就夠。
+    #
+    # 用白名單而不是 `!= 'dependabot[bot]'`：黑名單擋不住下一個接進來的 bot。
+    # （同 94cbfc5 收窄 claude-fix 白名單的理由。）
+    if: >-
+      github.event.pull_request.draft == false
+      && (github.event.pull_request.user.type != 'Bot'
+      || github.event.pull_request.user.login == 'github-actions[bot]')
     runs-on: ubuntu-latest
     permissions:
       contents: read

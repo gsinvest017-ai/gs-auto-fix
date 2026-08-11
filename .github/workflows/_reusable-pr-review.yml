@@ -121,19 +121,43 @@ jobs:
           echo "::error::diff 觸及敏感路徑，已中止 review"
           exit 1
 
-      # 缺 secret 時不要紅燈，只留一則 warning annotation。
-      # 這讓 repo 可以先合 workflow、之後再補 secret，中間不會對作者製造假紅燈。
-      - name: 檢查 token 是否已設定
+      # 兩個「乾淨跳過」的理由收在同一個 step，都只留 annotation、不製造紅燈。
+      #
+      # 刻意做在 step 層級而不是 job 的 `if:`：最後的「閘門判定」是要被拿去當 required
+      # status check 的，整個 job 被 skip 掉時它算 pass 還是永遠 pending，各家 branch
+      # protection 的行為並不一致。讓 job 照跑、綠燈收尾最沒有歧義。
+      # 附帶好處是不花 token 的敏感路徑檢查對機器人的 PR 也照樣生效。
+      - name: 決定是否執行 AI review
         id: precheck
         env:
           TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_AUTHOR_TYPE: ${{ github.event.pull_request.user.type }}
         run: |
+          set -euo pipefail
+
+          # 機器人的 PR 不送 review。理由有兩層：
+          #   1. 下面那個 step 的 allowed_bots 只放行 github-actions，其他 bot 會以
+          #      「Workflow initiated by non-human actor」直接 exit 1，變成一個作者
+          #      無從處理的紅燈。
+          #   2. 就算放行，教學型 review 的讀者是人，dependabot 的版本 bump 沒有人可以教。
+          #      依賴升版該由 CI 與安全掃描把關，不是由 LLM。
+          # 用白名單而不是 `!= 'dependabot[bot]'`：黑名單擋不住下一個接進來的 bot。
+          if [ "$PR_AUTHOR_TYPE" = "Bot" ] && [ "$PR_AUTHOR" != "github-actions[bot]" ]; then
+            echo "::notice::PR 作者是 $PR_AUTHOR（機器人），略過 AI review。"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 缺 secret 時不要紅燈，只留一則 warning annotation。
+          # 這讓 repo 可以先合 workflow、之後再補 secret，中間不會對作者製造假紅燈。
           if [ -z "${TOKEN:-}" ]; then
             echo "::warning::本 repo 尚未設定 CLAUDE_CODE_OAUTH_TOKEN，略過 AI review。設定方式：claude setup-token 取得長效 token 後 gh secret set CLAUDE_CODE_OAUTH_TOKEN -R <owner>/<repo>"
             echo "skip=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+
+          echo "skip=false" >> "$GITHUB_OUTPUT"
 
       # diff 由 workflow 自己抓成檔案，模型只 Read 不執行任何指令。
       # 這樣模型完全不需要 Bash，就沒有「被 diff 裡的注入文字誘導去呼叫 gh」的可能。
