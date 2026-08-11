@@ -168,6 +168,10 @@ Free private repo 的缺口是**方案問題不是技術問題**，三條路是�
   session 互搶。擴散到大量 repo 前先量測。
 - **`needs-work` label 可以被手動移除。** 這是刻意的——誤判時作者要有辦法繼續。
   代價是軟閘門更軟，硬閘門則不受影響（required check 會重跑）。
+- **`claude-review.yml` 的 `review` job 不要設成 required status check。** 它用 job 層級
+  `if:` 跳過機器人的 PR，而 job 被整個 skip 時各家 branch protection 對它算 pass 還是
+  pending 並不一致，設成 required 會讓 bot 的 PR 卡在 pending。需要真閘門請用本檔描述的
+  `_reusable-pr-review.yml`——它刻意改成 step 層級跳過，job 一定跑完並綠燈收尾。
 - **機器人開的 PR 不會被 review**（`github-actions[bot]` 除外）。dependabot / renovate 的版本
   bump 一律跳過，由 CI 與安全掃描把關。這是**白名單**：新接進來的 bot 預設不 review，
   要放行得同時改 `precheck` 的判斷與 action 的 `allowed_bots`——兩邊不一致就會紅燈，

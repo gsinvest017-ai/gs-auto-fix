@@ -20,6 +20,12 @@ jobs:
     #
     # 用白名單而不是 `!= 'dependabot[bot]'`：黑名單擋不住下一個接進來的 bot。
     # （同 94cbfc5 收窄 claude-fix 白名單的理由。）
+    #
+    # ⚠️ 這個 job **不要**設成 required status check。它是 job 層級的 `if:` 跳過，
+    # 而 job 被整個 skip 掉時，各家 branch protection 對它算 pass 還是永遠 pending
+    # 並不一致——設成 required 的話，bot 的 PR 有機會卡在 pending 永遠合不了。
+    # 本 job 只貼留言、沒有 label / 閘門機制，本來就不適合當 gate；需要真閘門請用
+    # `_reusable-pr-review.yml`，它刻意改成 step 層級跳過就是為了避開這個歧義。
     if: >-
       github.event.pull_request.draft == false
       && (github.event.pull_request.user.type != 'Bot'
