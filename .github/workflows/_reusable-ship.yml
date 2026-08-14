@@ -113,10 +113,16 @@ on:
         type: boolean
         default: false
       deploy_runner:
-        description: 部署 runner 的 labels，JSON 陣列字串
+        description: |
+          部署 runner 的 labels，JSON 陣列字串。
+
+          預設要求 linux + docker 兩個 label 而不是只有 self-hosted：
+          deploy.sh 是 bash + docker，落到 Windows self-hosted runner 上會用
+          一堆看不懂的錯誤失敗。本帳號同時有 Windows runner（rtx5090-win），
+          只寫 self-hosted 會兩台都匹配，排到哪台看運氣。
         required: false
         type: string
-        default: '["self-hosted"]'
+        default: '["self-hosted","linux","docker"]'
       deploy_env:
         description: 部署目標環境名（dev / prod），對應 GitHub Environment 保護規則
         required: false
