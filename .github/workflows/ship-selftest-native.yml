@@ -1,0 +1,135 @@
+name: ship-selftest-native
+
+# 原生換版流水線的自我測試，目標是 gs-mac。
+#
+# 為什麼要有這支，而 tests/e2e_ship_deploy_native.{sh,ps1} 不夠：
+#   那兩支直接呼叫腳本，驗的是換版邏輯本身。這支驗的是 Actions 這一層的接線
+#   ——artifact 從 build job 傳到 deploy job、sha256 跨 job 傳遞、.ship 在原生
+#   runner 上的 checkout、以及 runner label 有沒有真的選到目標主機。
+#   容器版的 pilot 就是在這一層踩到兩個「全綠但東西是錯的」問題。
+#
+# 這支會在 gs-mac 上留下一個跑著的服務（那就是 deploy 的定義），
+# 位置 ~/ship-selftest-native、port 18400，確認完可自行移除。
+
+# 只手動觸發：這支每跑一次就會真的部署到 gs-mac。
+on:
+  workflow_dispatch:
+
+jobs:
+  # build 與 test 由呼叫端自己做——原生專案的 build 是打包、測試在宿主上跑，
+  # 那本來就是各專案 CI 的職責，reusable workflow 不該猜。
+  build:
+    runs-on: ubuntu-latest
+    # 明寫最小權限。沒有這個區塊時 GITHUB_TOKEN 會拿到 repo 的預設權限，
+    # 而這個 job 只需要讀原始碼——多出來的權限只有在出事時才會被用到。
+    permissions:
+      contents: read
+    outputs:
+      sha: ${{ steps.pack.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 打包並算 sha256
+        id: pack
+        run: |
+          set -euo pipefail
+          mkdir -p out/app
+          # 最小服務：純標準庫、一個 /healthz。用 HTTPServer 而不是裸的
+          # socketserver.TCPServer——前者有設 SO_REUSEADDR。原生換版是「殺掉舊
+          # 行程、新行程綁同一個 port」，沒有它會撞 TIME_WAIT，症狀看起來會像
+          # 「新版不健康」。容器版沒這問題（各自的 network namespace）。
+          cat > out/app/app.py <<'PY'
+          import http.server, sys
+          VER = "selftest-native"
+          class H(http.server.BaseHTTPRequestHandler):
+              def do_GET(self):
+                  b = VER.encode()
+                  self.send_response(200)
+                  self.send_header("Content-Type", "text/plain; charset=utf-8")
+                  self.send_header("Content-Length", str(len(b)))
+                  self.end_headers(); self.wfile.write(b)
+              def log_message(self, *a): pass
+          http.server.HTTPServer(("", int(sys.argv[1])), H).serve_forever()
+          PY
+          # 服務定義跟著 artifact 走，而不是寫在 workflow 的 start_cmd 裡。
+          # 兩個理由：(a) YAML 內嵌 plist 的引號與換行極易出錯；(b) 真實的
+          # 原生專案本來就該自帶服務定義——它跟程式碼是同一版東西。
+          cat > out/app/start.sh <<'SH'
+          #!/usr/bin/env bash
+          # 由 deploy-native.sh 在 current/ 內執行。
+          # 一定要交給 launchd 而不是 nohup &：這段跑在 GitHub Actions 的 job 裡，
+          # runner 結束時會回收整個行程樹，nohup 起的服務會跟著消失——而健康檢查
+          # 在 job 執行中會通過，於是 deploy 報成功但服務其實沒活著。
+          set -euo pipefail
+          # 用 deploy-native.sh 匯出的變數，不要從 cwd 反推——cwd 是 symlink，
+          # `..` 在 logical（bash cd）與 physical（核心開檔）之間解析不一致。
+          ROOT="${SHIP_INSTALL_ROOT:?deploy-native.sh 應該要匯出這個}"
+          LABEL=ship-selftest-native
+          PLIST="$ROOT/$LABEL.plist"
+          mkdir -p "$ROOT/logs"
+          cat > "$PLIST" <<PLISTEOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>Label</key><string>$LABEL</string>
+            <key>ProgramArguments</key><array>
+              <string>/usr/bin/python3</string>
+              <string>$ROOT/current/app.py</string>
+              <string>18400</string>
+            </array>
+            <key>WorkingDirectory</key><string>$ROOT/current</string>
+            <key>StandardOutPath</key><string>$ROOT/logs/out.log</string>
+            <key>StandardErrorPath</key><string>$ROOT/logs/err.log</string>
+            <key>RunAtLoad</key><true/>
+          </dict></plist>
+          PLISTEOF
+          # plist 指向 current/ 而不是 releases/<sha>/，所以換版只要重新
+          # bootstrap 就會跑到新版。
+          launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+          launchctl bootstrap "gui/$(id -u)" "$PLIST"
+          sleep 2
+          SH
+          cat > out/app/stop.sh <<'SH'
+          #!/usr/bin/env bash
+          launchctl bootout "gui/$(id -u)/ship-selftest-native" 2>/dev/null || true
+          sleep 1
+          exit 0
+          SH
+          chmod +x out/app/start.sh out/app/stop.sh
+          tar czf out/selftest-native.tar.gz -C out/app .
+          sha=$(sha256sum out/selftest-native.tar.gz | cut -d' ' -f1)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "artifact sha256 = $sha" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: selftest-native
+          path: out/selftest-native.tar.gz
+          retention-days: 7
+
+  ship:
+    needs: build
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/_reusable-ship-native.yml
+    with:
+      pipeline_ref: ${{ github.ref_name }}
+
+      artifact_name: selftest-native
+      artifact_file: selftest-native.tar.gz
+      artifact_sha: ${{ needs.build.outputs.sha }}
+
+      # 明確指名 gs-mac：原生部署的 runner 就是目標主機本身，選錯機器＝部署到
+      # 錯的地方。這裡不能只寫 self-hosted。
+      deploy_runner: '["self-hosted","macOS","gs-mac"]'
+      runner_os: posix
+
+      service_name: ship-selftest-native
+      install_root: /Users/gsinvest017/ship-selftest-native
+      # 服務定義在 artifact 裡（build 階段產生），這裡只負責呼叫。
+      start_cmd: 'bash ./start.sh'
+      stop_cmd: 'bash "$SHIP_CURRENT/stop.sh" 2>/dev/null || true'
+      health_url: http://127.0.0.1:18400/
+      health_timeout: 30
+      keep_releases: 2

@@ -1,0 +1,149 @@
+"""report.py 的測試。
+
+重點不是「格式對不對」，而是那條不變量：**報表產生器不能是失敗點**。
+測試已經紅了的時候，報表再噴 traceback 只會把真正的失敗原因洗掉。
+所以壞掉的 XML、缺檔、空目錄都必須降級成「少一段」，而不是非零離開。
+"""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+from pathlib import Path
+
+REPORT = Path(__file__).resolve().parents[1] / "scripts" / "ship" / "report.py"
+
+JUNIT_OK = """<?xml version="1.0"?>
+<testsuites>
+  <testsuite name="pytest" tests="3" failures="0" errors="0" skipped="1" time="1.25">
+    <testcase classname="t.test_a" name="test_one" time="0.1"/>
+    <testcase classname="t.test_a" name="test_two" time="0.2"/>
+    <testcase classname="t.test_b" name="test_skipped"><skipped/></testcase>
+  </testsuite>
+</testsuites>
+"""
+
+JUNIT_FAIL = """<?xml version="1.0"?>
+<testsuites>
+  <testsuite name="pytest" tests="2" failures="1" errors="0" skipped="0" time="0.9">
+    <testcase classname="t.test_a" name="test_ok" time="0.1"/>
+    <testcase classname="t.test_a" name="test_bad" time="0.8">
+      <failure message="assert 1 == 2">E   assert 1 == 2
+E    +  where 1 = compute()</failure>
+    </testcase>
+  </testsuite>
+</testsuites>
+"""
+
+
+def run(report_dir: Path, **kw) -> subprocess.CompletedProcess:
+    args = [sys.executable, str(REPORT), str(report_dir), "--image", "ghcr.io/x/y@sha256:deadbeef"]
+    for k, v in kw.items():
+        args += [f"--{k.replace('_', '-')}", str(v)]
+    return subprocess.run(args, capture_output=True, text=True, encoding="utf-8")
+
+
+def make(tmp_path: Path, junit: str | None = None, **logs: str) -> Path:
+    d = tmp_path / "ship-report"
+    (d / "out").mkdir(parents=True)
+    for name, content in logs.items():
+        (d / f"{name}.log").write_text(content, encoding="utf-8")
+    if junit is not None:
+        (d / "out" / "junit.xml").write_text(junit, encoding="utf-8")
+    return d
+
+
+def test_全綠時報表說可以部署(tmp_path):
+    d = make(tmp_path, JUNIT_OK, smoke="SMOKE: 健康檢查通過")
+    r = run(d, smoke_rc=0, regression_rc=0)
+    assert r.returncode == 0, r.stderr
+    assert "✅ 打版測試報表" in r.stdout
+    assert "2/3 通過" in r.stdout          # 3 tests - 0 failures，skip 另計
+    assert "可以進入部署" in r.stdout
+
+
+def test_失敗案例會逐項列出含斷言細節(tmp_path):
+    d = make(tmp_path, JUNIT_FAIL, smoke="SMOKE: 健康檢查通過",
+             regression="1 failed, 1 passed")
+    r = run(d, smoke_rc=0, regression_rc=1)
+    assert r.returncode == 0, r.stderr
+    assert "❌" in r.stdout
+    assert "t.test_a::test_bad" in r.stdout
+    assert "assert 1 == 2" in r.stdout
+    assert "沒有**被部署" in r.stdout
+
+
+def test_smoke_失敗時帶出服務容器log(tmp_path):
+    d = make(tmp_path, None,
+             smoke="SMOKE: 健康檢查在 90s 內未通過",
+             service="Traceback: ImportError: no module named foo")
+    r = run(d, smoke_rc=1, regression_rc=0)
+    assert r.returncode == 0, r.stderr
+    assert "smoke 階段紀錄" in r.stdout
+    assert "ImportError" in r.stdout
+
+
+def test_沒有junit時退回regression原始輸出(tmp_path):
+    d = make(tmp_path, None, smoke="ok", regression="E   ValueError: boom")
+    r = run(d, smoke_rc=0, regression_rc=2)
+    assert r.returncode == 0, r.stderr
+    assert "無 junit.xml" in r.stdout
+    assert "ValueError: boom" in r.stdout
+
+
+def test_junit壞掉不會讓報表整個掛掉(tmp_path):
+    d = make(tmp_path, "<testsuites><this is not xml", smoke="ok")
+    r = run(d, smoke_rc=0, regression_rc=1)
+    assert r.returncode == 0, r.stderr
+    assert "打版測試報表" in r.stdout
+
+
+def test_空目錄也要產出報表(tmp_path):
+    d = tmp_path / "empty"
+    d.mkdir()
+    r = run(d, smoke_rc=1, regression_rc=0)
+    assert r.returncode == 0, r.stderr
+    assert "打版測試報表" in r.stdout
+
+
+def test_regression未執行不可報成通過(tmp_path):
+    """空的 regression_rc 代表「這趟沒跑」，不是「跑了而且過了」。
+
+    這條踩過：workflow 原本傳 --regression-rc "${REGR_RC:-0}"，把 step 被 skip
+    時的空字串預設成 "0"，報表就印出「regression test ✅ 通過」——一個從未執行
+    的測試被報成通過。閘門本身沒錯（沒跑就沒東西可失敗），錯的是報表在說謊。
+    """
+    d = make(tmp_path, smoke="SMOKE: 健康檢查通過")
+    r = run(d, smoke_rc=0, regression_rc="")
+    assert r.returncode == 0, r.stderr
+    assert "未執行" in r.stdout
+    assert "regression test | ✅ 通過" not in r.stdout
+    # smoke 過了、regression 沒跑 → 整體仍可部署
+    assert "可以進入部署" in r.stdout
+
+
+BILLION_LAUGHS = """<?xml version="1.0"?>
+<!DOCTYPE lolz [
+ <!ENTITY lol "lol">
+ <!ENTITY lol2 "&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;">
+ <!ENTITY lol3 "&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;">
+]>
+<testsuite name="x" tests="1" failures="0" errors="0" skipped="0" time="0.1">
+  <testcase classname="t" name="&lol3;" time="0.1"/>
+</testsuite>
+"""
+
+
+def test_帶DTD的junit要被拒收而不是解析(tmp_path):
+    """junit.xml 來自**被測容器**，是不受信任的輸入。
+
+    xml.etree 不展開外部實體，但會展開內部實體，所以擋不住 billion laughs。
+    合法的 JUnit XML 從來不需要 DTD，因此看到 DOCTYPE/ENTITY 就直接拒收——
+    代價是拒絕一種現實中不存在的合法輸入，換掉整類實體展開攻擊。
+    """
+    d = make(tmp_path, BILLION_LAUGHS, smoke="SMOKE: 健康檢查通過")
+    r = run(d, smoke_rc=0, regression_rc=0)
+    # 報表本身仍要產出（報表產生器不能是失敗點），只是不採計那份 XML
+    assert r.returncode == 0, r.stderr
+    assert "打版測試報表" in r.stdout
+    assert "測試案例" not in r.stdout      # 統計沒被填進去 = XML 被拒收了
