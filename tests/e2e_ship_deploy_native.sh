@@ -59,7 +59,12 @@ class H(http.server.BaseHTTPRequestHandler):
         if self.path == "/healthz" and not HEALTHY:
             self.send_response(500); self.end_headers(); return
         b = VER.encode()
-        self.send_response(200); self.send_header("Content-Length", str(len(b)))
+        self.send_response(200)
+        # 一定要送 Content-Type：沒有它時 PowerShell 的 Invoke-WebRequest 會把
+        # 回應當二進位，.Content 給的是 byte[] 而不是字串（curl 不在意，所以
+        # 只有 Windows 版的測試會炸，症狀是比對到「118 49」這種數字）。
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(b)))
         self.end_headers(); self.wfile.write(b)
     def log_message(self, *a): pass
 # 用 HTTPServer 而不是裸的 socketserver.TCPServer：前者有設
