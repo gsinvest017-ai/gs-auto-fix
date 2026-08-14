@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # deploy.sh 的端到端驗證 —— 需要本機有可用的 docker daemon。
 #
-# 驗三件事，每一件都是「壞掉會直接害到生產」的路徑：
+# 驗四件事，每一件都是「壞掉會直接害到生產」的路徑：
 #   1. 首次部署要能起來並對外服務
 #   2. 壞版本要在**閘門**就被擋掉，且線上舊版完全不受影響（零風險路徑）
-#   3. 換版成功時顏色要真的交替，且服務內容換成新版
+#   3. 換版成功時顏色要真的交替、服務內容換成新版，且舊 image 被清掉但
+#      上一版保留（清掉上一版 = 下一次失敗時無路可退）
+#   4. 過得了閘門、上線後才掛的版本，要自動回滾到上一版
 #
 # CI 不跑這支（GitHub runner 上起 daemon-in-daemon 太脆）；這是人在本機或在
 # 自架 runner 上手動跑的驗證。用法：bash tests/e2e_ship_deploy.sh
@@ -70,10 +72,13 @@ DF
   docker build -q -t shiptest:broken "$dir" >/dev/null
 }
 
+# 每個 image 都在「即將用到」時才 build，不要一開始全部建好。
+# deploy.sh 成功後會清掉同 repository 底下非現行、非上一版的 image（避免自架
+# runner 磁碟被舊版吃光），所以「未來版本已經躺在本機」這種狀態會被它正確地
+# 清掉——那是對的行為，但會把預先建好的 fixture 清光。生產環境本來也不會有
+# 這種狀態：image 是一次到一個。
 echo "== 準備測試 image =="
 build_app shiptest:v1 "version-1"
-build_app shiptest:v2 "version-2"
-build_broken
 docker pull -q curlimages/curl:8.11.1 >/dev/null
 
 run_deploy() {                     # run_deploy <image>
@@ -96,6 +101,7 @@ fi
 
 # ---------------------------------------------------------------- 2 壞版本
 echo "== 2. 壞版本必須在閘門被擋，線上不受影響 =="
+build_broken
 if run_deploy shiptest:broken >"$WORK/2.log" 2>&1; then
   bad "壞版本竟然部署成功了"
 else
@@ -108,12 +114,19 @@ fi
 
 # ---------------------------------------------------------------- 3 正常換版
 echo "== 3. 換到新版，顏色交替 =="
+build_app shiptest:v2 "version-2"
 if run_deploy shiptest:v2 >"$WORK/3.log" 2>&1; then
   [ "$(serving)" = "version-2" ] && ok "服務已換成 version-2" || bad "服務沒換：$(serving)"
   [ "$(color_of green)" = "true" ] && ok "新色 green 在跑" || bad "green 沒起來"
   docker inspect "${SVC}-blue" >/dev/null 2>&1 && bad "舊色沒清掉" || ok "舊色 blue 已清除"
   grep -q "PREV_IMAGE=shiptest:v2" "$SHIP_STATE_DIR/$SVC.env" \
     && ok "狀態檔記下這次的 image" || bad "狀態檔沒更新"
+  # 清理：此刻現行是 v2、上一版是 v1，broken 兩者皆非 → 該被清掉。
+  # 同時 v1 必須還在——它是回滾的唯一依據，清掉它等於讓下一次失敗無路可退。
+  docker image inspect shiptest:broken >/dev/null 2>&1 \
+    && bad "舊 image broken 沒被清掉（磁碟會單調成長）" || ok "不再需要的舊 image 已清除"
+  docker image inspect shiptest:v1 >/dev/null 2>&1 \
+    && ok "上一版 v1 保留（回滾靠它）" || bad "上一版被清掉了——回滾會失效"
 else
   bad "換版失敗"; sed 's/^/    /' "$WORK/3.log"
 fi

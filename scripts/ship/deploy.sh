@@ -138,19 +138,28 @@ prune_old_images() {                # prune_old_images <keep_current> <keep_prev
   local repo="${keep_cur%%@*}"; repo="${repo%%:*}"
   [ -n "$repo" ] || return 0
 
-  local line id dig ref removed=0
-  while read -r line; do
-    [ -n "$line" ] || continue
-    id="${line%% *}"; dig="${line##* }"
-    [ "$dig" = "<none>" ] && continue
-    ref="${repo}@${dig}"
-    [ "$ref" = "$keep_cur" ] && continue
-    [ -n "$keep_prev" ] && [ "$ref" = "$keep_prev" ] && continue
+  # 比對用 image ID，不要自己拼 repo@digest 字串去比。
+  # 踩過：IMAGE 可能是 tag 形式（沒有 @digest），拼出來的字串永遠不相等，
+  # 「保留清單」變成空集合、把全部都刪掉。而且 {{.Digest}} 對本機 build 的
+  # image 在 Docker 29 上回傳的是 image ID 而不是 <none>，連守衛也失效。
+  local keep_ids="" ref id
+  for ref in "$keep_cur" "$keep_prev"; do
+    [ -n "$ref" ] || continue
+    id="$(docker image inspect -f '{{.Id}}' "$ref" 2>/dev/null || true)"
+    [ -n "$id" ] && keep_ids="${keep_ids} ${id} "
+  done
+  # 一個都解析不出來就什麼都不做。寧可不清，也不要清錯。
+  [ -n "$keep_ids" ] || return 0
+
+  local removed=0
+  while read -r id; do
+    [ -n "$id" ] || continue
+    case "$keep_ids" in *" $id "*) continue ;; esac
     if docker rmi "$id" >/dev/null 2>&1; then
       removed=$((removed+1))
     fi
   done <<< "$(docker image ls --no-trunc --filter "reference=${repo}" \
-                --format '{{.ID}} {{.Digest}}' 2>/dev/null || true)"
+                --format '{{.ID}}' 2>/dev/null | sort -u || true)"
 
   [ "$removed" -gt 0 ] && log "清掉 $removed 個不再需要的舊 image（保留現行版與上一版）"
   return 0
