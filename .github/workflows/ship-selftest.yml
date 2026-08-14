@@ -25,6 +25,13 @@ on:
         description: 是否連 deploy 一起驗（需要 linux+docker 自架 runner）
         type: boolean
         default: true
+      fail_smoke:
+        description: |
+          故意讓 smoke test 失敗，用來驗 notify_failure 那條路徑。
+          失敗路徑跟成功路徑一樣重要——報表要有內容、issue 要開得出來、
+          同 sha 重試要去重而不是洗版——但它平常不會被執行到，只能刻意觸發。
+        type: boolean
+        default: false
 
 jobs:
   selftest:
@@ -42,7 +49,10 @@ jobs:
       dockerfile: tests/fixtures/selftest/Dockerfile
       container_port: 8099
       health_path: /healthz
-      smoke_cmd: python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8099/healthz').read())"
+      # fail_smoke=true 時換成必定失敗的指令，用來驗 notify_failure。
+      # exit 7 是刻意挑的非常見碼，在報表裡一眼認得出是刻意失敗而非真的壞了。
+      # push 事件沒有 inputs，inputs.fail_smoke 為 null（falsy），自動走正常分支。
+      smoke_cmd: echo "TEMP: 刻意失敗以驗證 notify_failure"; exit 7
 
       # push 事件沒有 inputs，${{ inputs.deploy }} 會是空字串（= false）。
       # 寫成這樣讓 push 預設驗完整條，dispatch 則尊重使用者勾選。
