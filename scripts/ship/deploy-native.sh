@@ -21,6 +21,15 @@
 # start/stop/health 由呼叫端提供，本腳本不綁死 LaunchAgent 或任何服務管理器
 # —— 那是各 repo 自己的事，寫死只會逼所有人用同一套。
 #
+# ⚠ START_CMD 必須把服務交給真正的服務管理器（launchd / systemd /
+#   Scheduled Task），**不能用 `nohup … &`**。這條腳本在 GitHub Actions 的
+#   job 裡執行，而 runner 在 job 結束時會回收整個行程樹——背景行程會被一起
+#   殺掉。最惡劣的是失敗方式：健康檢查在 job 執行中會通過，deploy 報成功，
+#   服務卻在 job 結束的瞬間消失。實際踩過（ship-selftest-native 首次上線）。
+#
+# ⚠ START_CMD 在 `current`（symlink）內執行，所以 `../` 由核心解析成**實體**
+#   父目錄 `releases/`，不是安裝根目錄。要指到安裝根請用絕對路徑，別用 `..`。
+#
 # 必要環境變數：
 #   ARTIFACT       .tar.gz / .zip 路徑（已由 CI 下載到本機）
 #   ARTIFACT_SHA   期望的 sha256（build 階段算的）
@@ -54,6 +63,15 @@ STATE="$INSTALL_ROOT/.ship-state"
 
 log() { printf '[ship-native] %s\n' "$*"; }
 die() { printf '::error::%s\n' "$*" >&2; exit 1; }
+
+# 匯出給 START_CMD / STOP_CMD / HEALTH_CMD 用。
+# 沒有這些的話，呼叫端只能從 cwd 反推安裝根——而 cwd 是 symlink，`..` 的解析
+# 在 logical（bash cd）與 physical（核心開檔）之間不一致，非常容易寫錯而且
+# 錯得很安靜。給明確的變數，不要逼人猜。
+export SHIP_SERVICE="$SERVICE"
+export SHIP_INSTALL_ROOT="$INSTALL_ROOT"
+export SHIP_CURRENT="$INSTALL_ROOT/current"
+export SHIP_RELEASES="$INSTALL_ROOT/releases"
 
 # ---------------------------------------------------------------- 驗 artifact
 [ -f "$ARTIFACT" ] || die "artifact 不存在：$ARTIFACT"
