@@ -104,3 +104,19 @@ def test_空目錄也要產出報表(tmp_path):
     r = run(d, smoke_rc=1, regression_rc=0)
     assert r.returncode == 0, r.stderr
     assert "打版測試報表" in r.stdout
+
+
+def test_regression未執行不可報成通過(tmp_path):
+    """空的 regression_rc 代表「這趟沒跑」，不是「跑了而且過了」。
+
+    這條踩過：workflow 原本傳 --regression-rc "${REGR_RC:-0}"，把 step 被 skip
+    時的空字串預設成 "0"，報表就印出「regression test ✅ 通過」——一個從未執行
+    的測試被報成通過。閘門本身沒錯（沒跑就沒東西可失敗），錯的是報表在說謊。
+    """
+    d = make(tmp_path, smoke="SMOKE: 健康檢查通過")
+    r = run(d, smoke_rc=0, regression_rc="")
+    assert r.returncode == 0, r.stderr
+    assert "未執行" in r.stdout
+    assert "regression test | ✅ 通過" not in r.stdout
+    # smoke 過了、regression 沒跑 → 整體仍可部署
+    assert "可以進入部署" in r.stdout

@@ -93,7 +93,12 @@ def main() -> int:
 
     out += ["| 項目 | 結果 |", "|---|---|"]
     out.append(f"| smoke test | {'✅ 通過' if smoke_ok else '❌ 失敗'} |")
-    if a.regression_rc not in ("", None):
+    # 空字串 = 這一趟沒跑 regression（step 被 skip 或呼叫端沒設 regression_cmd）。
+    # 明寫「未執行」而不是省略這一列：省略會讓讀報表的人以為沒有 regression 這回事，
+    # 但真正該知道的是「有這道關卡，只是這次沒過關卡」。更不能印成通過。
+    if a.regression_rc in ("", None):
+        out.append("| regression test | ⏭ 未執行（未設定 regression_cmd） |")
+    else:
         out.append(f"| regression test | {'✅ 通過' if regr_ok else f'❌ 失敗（exit {a.regression_rc}）'} |")
     if stats["tests"]:
         # skipped 不算通過。JUnit 的 tests 屬性含 skipped，直接拿來當分子會把

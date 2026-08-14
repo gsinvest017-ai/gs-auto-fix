@@ -409,10 +409,14 @@ jobs:
           REGR_RC: ${{ steps.regr_run.outputs.rc }}
         run: |
           set -euo pipefail
+          # REGR_RC 刻意**不給預設值**。regression step 被 skip 時它是空字串，
+          # 而 report.py 用「空 = 沒跑」來區分未執行與通過。這裡若寫成
+          # ${REGR_RC:-0} 就會把「沒跑」變成「exit 0」，報表印出「regression
+          # test ✅ 通過」——一個從未執行的測試被報成通過。
           python3 .ship/scripts/ship/report.py ship-report \
             --image "$IMAGE" \
             --smoke-rc "${SMOKE_RC:-0}" \
-            --regression-rc "${REGR_RC:-0}" \
+            --regression-rc "${REGR_RC-}" \
             --repo "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" \
             --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             > ship-report/report.md 2>ship-report/report.err || {
