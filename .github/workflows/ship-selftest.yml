@@ -1,0 +1,53 @@
+name: ship-selftest
+
+# 打版流水線的自我測試：拿一支最小服務把 _reusable-ship.yml 從頭跑到尾，
+# **包含 deploy**。
+#
+# 為什麼需要它，而 tests/e2e_ship_deploy.sh 不夠：
+#   那支直接呼叫 deploy.sh，驗的是換版邏輯（閘門、顏色交替、回滾）。
+#   但流水線在 Actions 這一層還有一整組接線沒被驗到——job 權限、environment
+#   閘門、.ship 在 deploy runner 上的 checkout、digest 從 build job 傳到
+#   deploy job。那些壞掉的症狀跟換版邏輯壞掉完全不同。
+#
+# 這支會在自架 runner 上留下一個跑著的容器（那就是 deploy 的定義），
+# 名稱 ship-selftest、port 18099，確認完可以自行移除。
+#
+# push 觸發是暫時的：workflow_dispatch 只有在**預設分支**上的 workflow 才觸發
+# 得了，而開發期間本檔還在 dev 分支。合併到 main 後應該把 push 那段拿掉，
+# 只留 workflow_dispatch——否則每次動這個分支都會真的部署一次。
+
+on:
+  push:
+    branches: [dev/ship-pipeline]
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: 是否連 deploy 一起驗（需要 linux+docker 自架 runner）
+        type: boolean
+        default: true
+
+jobs:
+  selftest:
+    permissions:
+      contents: read
+      packages: write
+      issues: write
+    uses: ./.github/workflows/_reusable-ship.yml
+    with:
+      # 同 repo 呼叫時 uses: ./… 會用當前 commit 的 workflow 檔，
+      # 所以 pipeline_ref 也要指到當前分支才會拿到同一版腳本。
+      pipeline_ref: ${{ github.ref_name }}
+
+      image_name: ship-selftest
+      dockerfile: tests/fixtures/selftest/Dockerfile
+      container_port: 8099
+      health_path: /healthz
+      smoke_cmd: python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8099/healthz').read())"
+
+      # push 事件沒有 inputs，${{ inputs.deploy }} 會是空字串（= false）。
+      # 寫成這樣讓 push 預設驗完整條，dispatch 則尊重使用者勾選。
+      deploy: ${{ github.event_name != 'workflow_dispatch' || inputs.deploy }}
+      deploy_env: dev
+      service_name: ship-selftest
+      published_port: 18099
+      strategy: recreate
