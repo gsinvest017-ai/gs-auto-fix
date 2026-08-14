@@ -1,0 +1,10 @@
+# 在 Windows 上 clone 時，core.autocrlf=true 會把 checkout 出來的檔案轉成 CRLF。
+# 對 .sh 而言這是致命的：帶 CR 的腳本在 Linux runner 上執行會噴
+# `\r: command not found`，而且錯誤訊息完全指不到真正的原因。
+#
+# 本 repo 的 .sh 都是給 GitHub Actions 的 Linux/自架 runner 跑的，一律鎖 LF。
+*.sh text eol=lf
+
+# workflow 由 Actions runner（Linux）解析，同樣鎖 LF
+*.yml text eol=lf
+*.yaml text eol=lf

@@ -1,0 +1,515 @@
+name: Reusable ship pipeline
+
+# 一條「打版 → 沙盒測試 → 出報表 → 無縫換版」的可重用流水線。
+#
+# 為什麼是 workflow_call：
+#   這條流水線對每個 repo 幾乎一模一樣，只有「怎麼測、部到哪」不同。
+#   散成 N 份副本就會有 N 份漂移。本檔是唯一真相來源，各 repo 只放 caller stub 並釘 @v1。
+#
+# ── 核心不變量：被測的 artifact 就是被部署的 artifact ──────────────────
+#   build 之後一切都用 **digest**（ghcr.io/o/n@sha256:…）指稱 image，不用 tag。
+#   tag 是會動的指標；用 tag 的話「測過的版本」和「部下去的版本」在
+#   race 下可能是兩個不同的 image，測試就白測了。
+#
+# ── 沙盒 ────────────────────────────────────────────────────────────────
+#   測試在容器裡跑，且預設 `--network` 是專用 bridge、不掛任何宿主目錄、
+#   丟掉所有 capability。要對外連線的測試請自己在 smoke_cmd 內處理，
+#   或把 allow_egress 設成 true 並在 PR 說明理由。
+#
+# ── 失敗時 ──────────────────────────────────────────────────────────────
+#   1. JUnit XML + 容器 log + 診斷摘要打包成 artifact（保留 30 天）
+#   2. 寫進 job summary（不用下載就看得到哪個 test 掛了）
+#   3. 開/更新一張 issue，標 ship-failure；可選再標 auto-fix 交給修復流水線
+
+on:
+  workflow_call:
+    inputs:
+      # ---------------- build ----------------
+      image_name:
+        description: ghcr 上的 image 名稱（預設用 repo 名）
+        required: false
+        type: string
+        default: ""
+      dockerfile:
+        description: Dockerfile 路徑
+        required: false
+        type: string
+        default: Dockerfile
+      build_context:
+        description: build context 路徑
+        required: false
+        type: string
+        default: "."
+      build_args:
+        description: 傳給 docker build 的 --build-arg，一行一個 KEY=VALUE
+        required: false
+        type: string
+        default: ""
+      platforms:
+        description: 目標平台（多平台會顯著拉長 build 時間）
+        required: false
+        type: string
+        default: linux/amd64
+      dev_branch:
+        description: 哪個分支的 push 要打上 :dev 這個移動 tag
+        required: false
+        type: string
+        default: develop
+
+      # ---------------- test ----------------
+      test_runner:
+        description: |
+          測試要跑在哪台 runner，JSON 陣列字串。
+          預設 GitHub 託管的 Linux；要在內網測試主機跑就填
+          '["self-hosted","linux","test-box"]'。
+        required: false
+        type: string
+        default: '"ubuntu-latest"'
+      health_path:
+        description: 服務健康檢查路徑；留空代表這是 CLI/批次程式，不做 HTTP 探測
+        required: false
+        type: string
+        default: ""
+      container_port:
+        description: 容器內服務監聽的 port
+        required: false
+        type: number
+        default: 8000
+      health_timeout:
+        description: 等健康檢查通過的秒數上限
+        required: false
+        type: number
+        default: 90
+      smoke_cmd:
+        description: |
+          smoke test：驗「這版能不能起來、最基本的路徑通不通」。
+          在**已啟動的服務容器內**用 docker exec 執行。留空則只做 HTTP 健康探測。
+        required: false
+        type: string
+        default: ""
+      regression_cmd:
+        description: |
+          regression test：驗「舊行為有沒有被改壞」。
+          在**新開的一次性容器**內執行（不共用 smoke 的狀態）。
+          請讓它輸出 JUnit XML 到 /out/junit.xml，報表才有逐項結果。
+        required: false
+        type: string
+        default: ""
+      allow_egress:
+        description: 測試容器是否允許對外連網（預設否；沙盒預設要密）
+        required: false
+        type: boolean
+        default: false
+      test_env:
+        description: 傳進測試容器的環境變數，一行一個 KEY=VALUE（不要放祕密）
+        required: false
+        type: string
+        default: ""
+
+      # ---------------- deploy ----------------
+      deploy:
+        description: 測試通過後是否自動部署
+        required: false
+        type: boolean
+        default: false
+      deploy_runner:
+        description: 部署 runner 的 labels，JSON 陣列字串
+        required: false
+        type: string
+        default: '["self-hosted"]'
+      deploy_env:
+        description: 部署目標環境名（dev / prod），對應 GitHub Environment 保護規則
+        required: false
+        type: string
+        default: dev
+      service_name:
+        description: 部署後的容器名前綴（藍綠會加上 -blue / -green）
+        required: false
+        type: string
+        default: ""
+      published_port:
+        description: 宿主上對外的 port
+        required: false
+        type: number
+        default: 0
+      strategy:
+        description: |
+          proxy   = 反向代理上游切換，真正零停機（需要 caddy_admin）
+          recreate = 健康閘門 + 失敗自動回滾，換版之際有數秒空窗
+        required: false
+        type: string
+        default: recreate
+      caddy_admin:
+        description: Caddy admin API（例：http://192.168.11.90:2019），strategy=proxy 時必填
+        required: false
+        type: string
+        default: ""
+      deploy_extra_args:
+        description: 額外傳給 docker run 的參數（掛載、環境檔等）
+        required: false
+        type: string
+        default: ""
+
+      # ---------------- 失敗通報 ----------------
+      hand_to_autofix:
+        description: 失敗時是否順手標 auto-fix，交給自動修復流水線
+        required: false
+        type: boolean
+        default: false
+
+    outputs:
+      image:
+        description: 這次 build 出來的 image digest（測試與部署都指這個）
+        value: ${{ jobs.build.outputs.image }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.out.outputs.image }}
+      tags: ${{ steps.meta.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # cache-to: type=gha 需要 docker-container driver，預設 driver 不支援 cache export
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 決定 image 名稱
+        id: name
+        env:
+          OVERRIDE: ${{ inputs.image_name }}
+        run: |
+          set -euo pipefail
+          name="${OVERRIDE:-${GITHUB_REPOSITORY##*/}}"
+          # ghcr 只吃小寫
+          echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${name,,}" >> "$GITHUB_OUTPUT"
+
+      - name: 計算 tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.name.outputs.image }}
+          tags: |
+            type=sha,format=long
+            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', inputs.dev_branch) }}
+            type=ref,event=tag
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      - name: Build & push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.build_context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          build-args: ${{ inputs.build_args }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          cache-from: type=gha,scope=${{ github.workflow }}
+          cache-to: type=gha,mode=max,scope=${{ github.workflow }}
+
+      # 之後每一步都只認這個 digest。tag 會漂，digest 不會。
+      - name: 釘住 digest
+        id: out
+        run: |
+          set -euo pipefail
+          echo "image=${{ steps.name.outputs.image }}@${{ steps.push.outputs.digest }}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### 建置產物"
+            echo
+            echo '```'
+            echo "${{ steps.name.outputs.image }}@${{ steps.push.outputs.digest }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ───────────────────────────────────────────────────────────────────────
+  test:
+    needs: build
+    runs-on: ${{ fromJSON(inputs.test_runner) }}
+    permissions:
+      contents: read
+      packages: read
+    env:
+      IMAGE: ${{ needs.build.outputs.image }}
+      HEALTH_PATH: ${{ inputs.health_path }}
+      CPORT: ${{ inputs.container_port }}
+      HEALTH_TIMEOUT: ${{ inputs.health_timeout }}
+      SMOKE_CMD: ${{ inputs.smoke_cmd }}
+      REGRESSION_CMD: ${{ inputs.regression_cmd }}
+      TEST_ENV: ${{ inputs.test_env }}
+      ALLOW_EGRESS: ${{ inputs.allow_egress }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # 本流水線的輔助腳本住在 gs-auto-fix，不在呼叫端 repo，所以要自己拉一份。
+      #
+      # ref 用 job_workflow_sha 而不是寫死 v1：那是**本檔自己**被載入時的 commit
+      # sha。呼叫端釘 @v1 就拿 v1 的腳本、釘 @v2 就拿 v2 的，腳本與 workflow
+      # 永遠同一個 commit，不可能配錯版。寫死 tag 的話，忘記把 tag 移過來就會
+      # 讓所有 caller 在這一步靜默壞掉——而且錯的是被呼叫端，很難追。
+      - name: 取得流水線輔助腳本
+        uses: actions/checkout@v4
+        with:
+          repository: gsinvest017-ai/gs-auto-fix
+          ref: ${{ github.job_workflow_sha }}
+          path: .ship
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 準備沙盒
+        run: |
+          set -euo pipefail
+          mkdir -p ship-report
+          docker pull "$IMAGE"
+          # 先在宿主把探針 image 拉下來：internal 網路裡的容器沒有出口，
+          # 等到要探測時才 pull 就會失敗。
+          docker pull curlimages/curl:8.11.1
+          # 專用 bridge：測試容器彼此可見，但拿不到宿主網路上的其他服務。
+          # internal=true 連 NAT 出口都沒有 —— 測試若偷連外網會直接失敗而不是靜默通過。
+          if [ "$ALLOW_EGRESS" = "true" ]; then
+            docker network create ship-sbx >/dev/null
+            echo "::warning::測試容器開了對外連網（allow_egress=true），測試結果會受外部服務狀態影響"
+          else
+            docker network create --internal ship-sbx >/dev/null
+          fi
+
+      - name: Smoke test（起服務 → 健康探測 → 基本路徑）
+        id: smoke_run
+        run: |
+          set -uo pipefail
+          rc=0
+          envargs=()
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            envargs+=( -e "$line" )
+          done <<< "${TEST_ENV}"
+
+          # 沙盒硬化：唯讀根檔案系統、丟掉所有 capability、禁止提權。
+          # 測試若因此失敗，那是這個 image 需要的權限比它該有的多 —— 值得知道。
+          docker run -d --name ship-svc --network ship-sbx \
+            --cap-drop ALL --security-opt no-new-privileges \
+            --tmpfs /tmp:rw,noexec,nosuid \
+            "${envargs[@]}" "$IMAGE" > ship-report/container-id.txt 2>&1 || rc=1
+
+          if [ $rc -ne 0 ]; then
+            echo "SMOKE: 容器啟動失敗" | tee -a ship-report/smoke.log
+            cat ship-report/container-id.txt >> ship-report/smoke.log
+            echo "rc=1" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          if [ -n "$HEALTH_PATH" ]; then
+            deadline=$(( $(date +%s) + HEALTH_TIMEOUT ))
+            ok=0
+            while [ "$(date +%s)" -lt "$deadline" ]; do
+              # 從沙盒網路內部探測，不需要把 port 曝到宿主
+              if docker run --rm --network ship-sbx curlimages/curl:8.11.1 \
+                   -fsS --max-time 5 "http://ship-svc:${CPORT}${HEALTH_PATH}" >/dev/null 2>&1; then
+                ok=1; break
+              fi
+              sleep 2
+            done
+            if [ $ok -ne 1 ]; then
+              echo "SMOKE: 健康檢查在 ${HEALTH_TIMEOUT}s 內未通過（http://ship-svc:${CPORT}${HEALTH_PATH}）" \
+                | tee -a ship-report/smoke.log
+              rc=1
+            else
+              echo "SMOKE: 健康檢查通過" | tee -a ship-report/smoke.log
+            fi
+          fi
+
+          if [ $rc -eq 0 ] && [ -n "$SMOKE_CMD" ]; then
+            if docker exec ship-svc sh -lc "$SMOKE_CMD" >> ship-report/smoke.log 2>&1; then
+              echo "SMOKE: 自訂指令通過" >> ship-report/smoke.log
+            else
+              echo "SMOKE: 自訂指令失敗（$SMOKE_CMD）" >> ship-report/smoke.log
+              rc=1
+            fi
+          fi
+
+          docker logs ship-svc > ship-report/service.log 2>&1 || true
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+      - name: Regression test（乾淨容器，不共用 smoke 的狀態）
+        id: regr_run
+        if: inputs.regression_cmd != ''
+        run: |
+          set -uo pipefail
+          envargs=()
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            envargs+=( -e "$line" )
+          done <<< "${TEST_ENV}"
+
+          mkdir -p "$PWD/ship-report/out"
+          rc=0
+          docker run --rm --name ship-regr --network ship-sbx \
+            --cap-drop ALL --security-opt no-new-privileges \
+            -v "$PWD/ship-report/out:/out" \
+            "${envargs[@]}" "$IMAGE" \
+            sh -lc "$REGRESSION_CMD" > ship-report/regression.log 2>&1 || rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          tail -50 ship-report/regression.log || true
+
+      - name: 產生錯誤報表
+        if: always()
+        env:
+          SMOKE_RC: ${{ steps.smoke_run.outputs.rc }}
+          REGR_RC: ${{ steps.regr_run.outputs.rc }}
+        run: |
+          set -euo pipefail
+          python3 .ship/scripts/ship/report.py ship-report \
+            --image "$IMAGE" \
+            --smoke-rc "${SMOKE_RC:-0}" \
+            --regression-rc "${REGR_RC:-0}" \
+            --repo "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" \
+            --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            > ship-report/report.md 2>ship-report/report.err || {
+              # 報表產不出來不該吃掉真正的測試結果
+              echo "::warning::報表產生器失敗，改用原始 log"
+              { echo "## 測試報表產生失敗"; echo '```'; cat ship-report/report.err; echo '```'; } > ship-report/report.md
+            }
+          cat ship-report/report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上傳測試報表
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ship-report-${{ github.sha }}
+          path: ship-report/
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: 收拾沙盒
+        if: always()
+        run: |
+          docker rm -f ship-svc >/dev/null 2>&1 || true
+          docker network rm ship-sbx >/dev/null 2>&1 || true
+
+      # 判定放最後：報表一定要先產出、先上傳，紅燈才有東西可看。
+      - name: 測試閘門
+        if: always()
+        env:
+          SMOKE_RC: ${{ steps.smoke_run.outputs.rc }}
+          REGR_RC: ${{ steps.regr_run.outputs.rc }}
+        run: |
+          set -euo pipefail
+          fail=0
+          [ "${SMOKE_RC:-0}" != "0" ] && { echo "::error::smoke test 失敗"; fail=1; }
+          [ "${REGR_RC:-0}" != "0" ] && { echo "::error::regression test 失敗"; fail=1; }
+          if [ $fail -ne 0 ]; then
+            echo "::error::測試未通過，不會部署。報表見 artifact ship-report-${GITHUB_SHA}"
+            exit 1
+          fi
+          echo "測試全數通過"
+
+  # ───────────────────────────────────────────────────────────────────────
+  notify_failure:
+    needs: [build, test]
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ship-report-${{ github.sha }}
+          path: ship-report
+        continue-on-error: true
+
+      - name: 開 / 更新 ship-failure issue
+        run: |
+          set -euo pipefail
+          gh label create ship-failure --color B60205 \
+            --description "打版流水線測試失敗" -R "$GITHUB_REPOSITORY" 2>/dev/null || true
+
+          title="打版失敗：${GITHUB_REF_NAME} @ ${GITHUB_SHA:0:7}"
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          {
+            echo "打版流水線在 \`${GITHUB_REF_NAME}\` 上失敗，這一版**沒有**被部署。"
+            echo
+            echo "- commit: \`${GITHUB_SHA}\`"
+            echo "- 執行紀錄：$run_url"
+            echo "- 完整報表：該次 run 的 artifact \`ship-report-${GITHUB_SHA}\`"
+            echo
+            if [ -f ship-report/report.md ]; then
+              cat ship-report/report.md
+            else
+              echo "> 報表 artifact 不存在——多半是 build 階段就掛了，請直接看執行紀錄。"
+            fi
+          } > issue-body.md
+
+          # 同一個 sha 重跑時更新既有 issue，不要每次重試都開一張新的
+          existing=$(gh issue list -R "$GITHUB_REPOSITORY" --label ship-failure --state open \
+            --search "${GITHUB_SHA:0:7} in:title" --json number --jq '.[0].number' 2>/dev/null || true)
+          if [ -n "$existing" ] && [ "$existing" != "null" ]; then
+            gh issue comment "$existing" -R "$GITHUB_REPOSITORY" --body-file issue-body.md
+          else
+            labels="ship-failure"
+            [ "${{ inputs.hand_to_autofix }}" = "true" ] && labels="ship-failure,auto-fix"
+            gh issue create -R "$GITHUB_REPOSITORY" --title "$title" \
+              --body-file issue-body.md --label "$labels"
+          fi
+
+  # ───────────────────────────────────────────────────────────────────────
+  deploy:
+    needs: [build, test]
+    if: inputs.deploy && needs.test.result == 'success'
+    runs-on: ${{ fromJSON(inputs.deploy_runner) }}
+    environment: ${{ inputs.deploy_env }}
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 取得流水線輔助腳本
+        uses: actions/checkout@v4
+        with:
+          repository: gsinvest017-ai/gs-auto-fix
+          ref: ${{ github.job_workflow_sha }}
+          path: .ship
+
+      - name: 藍綠換版
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}
+          SERVICE: ${{ inputs.service_name }}
+          PUBLISHED_PORT: ${{ inputs.published_port }}
+          CONTAINER_PORT: ${{ inputs.container_port }}
+          HEALTH_PATH: ${{ inputs.health_path }}
+          HEALTH_TIMEOUT: ${{ inputs.health_timeout }}
+          STRATEGY: ${{ inputs.strategy }}
+          CADDY_ADMIN: ${{ inputs.caddy_admin }}
+          EXTRA_ARGS: ${{ inputs.deploy_extra_args }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash .ship/scripts/ship/deploy.sh
+
+      - name: 部署失敗時抓現場
+        if: failure()
+        run: |
+          docker ps -a --filter "name=${{ inputs.service_name }}" || true
+          docker logs --tail 200 "${{ inputs.service_name }}-blue" 2>&1 || true
+          docker logs --tail 200 "${{ inputs.service_name }}-green" 2>&1 || true
