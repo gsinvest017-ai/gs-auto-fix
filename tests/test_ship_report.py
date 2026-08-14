@@ -120,3 +120,30 @@ def test_regression未執行不可報成通過(tmp_path):
     assert "regression test | ✅ 通過" not in r.stdout
     # smoke 過了、regression 沒跑 → 整體仍可部署
     assert "可以進入部署" in r.stdout
+
+
+BILLION_LAUGHS = """<?xml version="1.0"?>
+<!DOCTYPE lolz [
+ <!ENTITY lol "lol">
+ <!ENTITY lol2 "&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;">
+ <!ENTITY lol3 "&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;">
+]>
+<testsuite name="x" tests="1" failures="0" errors="0" skipped="0" time="0.1">
+  <testcase classname="t" name="&lol3;" time="0.1"/>
+</testsuite>
+"""
+
+
+def test_帶DTD的junit要被拒收而不是解析(tmp_path):
+    """junit.xml 來自**被測容器**，是不受信任的輸入。
+
+    xml.etree 不展開外部實體，但會展開內部實體，所以擋不住 billion laughs。
+    合法的 JUnit XML 從來不需要 DTD，因此看到 DOCTYPE/ENTITY 就直接拒收——
+    代價是拒絕一種現實中不存在的合法輸入，換掉整類實體展開攻擊。
+    """
+    d = make(tmp_path, BILLION_LAUGHS, smoke="SMOKE: 健康檢查通過")
+    r = run(d, smoke_rc=0, regression_rc=0)
+    # 報表本身仍要產出（報表產生器不能是失敗點），只是不採計那份 XML
+    assert r.returncode == 0, r.stderr
+    assert "打版測試報表" in r.stdout
+    assert "測試案例" not in r.stdout      # 統計沒被填進去 = XML 被拒收了

@@ -32,13 +32,36 @@ def tail(path: Path, n: int = MAX_LOG_LINES) -> list[str]:
     return lines[-n:]
 
 
+# junit.xml 是**被測容器**寫出來的，也就是不受信任的輸入。xml.etree 不會展開
+# 外部實體，但會展開內部實體，所以擋不住 billion laughs（一個幾 KB 的檔案展開
+# 成數 GB，把報表步驟吃掉記憶體）。
+#
+# 正解是 defusedxml，但本檔的前提是「純 stdlib、沒有安裝步驟」——報表產生器多
+# 一個安裝步驟就多一個失敗點，而它的職責正是「不能是失敗點」。
+#
+# 用 stdlib 能做到的等效防護：合法的 JUnit XML 從來不需要 DTD，所以看到
+# DOCTYPE 或 ENTITY 宣告就直接拒收。這擋掉整類實體展開攻擊，代價是拒絕一種
+# 現實中不存在的合法輸入。另外加檔案大小上限擋掉單純的巨大檔。
+MAX_JUNIT_BYTES = 20 * 1024 * 1024
+_DTD_MARKERS = (b"<!DOCTYPE", b"<!ENTITY")
+
+
 def parse_junit(path: Path) -> tuple[dict, list[dict]]:
     """回傳 (統計, 失敗案例清單)。解析失敗就回空的，不中斷報表。"""
     stats = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0, "time": 0.0}
     failures: list[dict] = []
     try:
-        root = ET.parse(path).getroot()
-    except (ET.ParseError, OSError):
+        raw = path.read_bytes()
+    except OSError:
+        return stats, failures
+    if len(raw) > MAX_JUNIT_BYTES:
+        return stats, failures
+    head = raw[:4096].upper()
+    if any(m in head for m in _DTD_MARKERS):
+        return stats, failures
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError:
         return stats, failures
 
     suites = [root] if root.tag == "testsuite" else root.findall(".//testsuite")

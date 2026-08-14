@@ -106,6 +106,23 @@ jobs:
           name: ${{ inputs.artifact_name }}
           path: ship-artifact
 
+      # pipeline_ref 會被直接拿去 checkout 然後執行裡面的腳本，所以先擋掉奇形怪狀
+      # 的 ref。只接受版本 tag、40 位 commit sha、或 dev/ 開頭的開發分支。
+      #
+      # 這不是萬靈丹——能在 gs-auto-fix 建 ref 的人本來就能直接改 scripts/ship/，
+      # pipeline_ref 沒有給攻擊者新的權限。但把可接受的形狀寫死，能擋掉打錯字、
+      # 擋掉從別處誤傳進來的值，也讓 CodeQL 的 cache-poisoning 路徑收斂。
+      - name: 檢查 pipeline_ref 格式
+        shell: bash
+        env:
+          REF: ${{ inputs.pipeline_ref }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$REF" | grep -Eq '^(v[0-9][0-9A-Za-z._-]*|[0-9a-f]{40}|dev/[A-Za-z0-9._/-]+)$'; then
+            echo "::error::pipeline_ref 不符允許格式（v* / 40 位 sha / dev/*）"
+            exit 1
+          fi
+
       - name: 取得流水線輔助腳本
         uses: actions/checkout@v4
         with:
@@ -117,11 +134,16 @@ jobs:
       # 腳本不存在要等到執行那步才發現，而那時錯誤訊息指不回真正的原因。
       - name: 確認輔助腳本到位
         shell: bash
+        env:
+          # 走 env 而不是把 ${{ }} 直接內插進 run: —— 表達式內插是 script
+          # injection 面，值裡的引號或分號會變成可執行的 shell。
+          REF: ${{ inputs.pipeline_ref }}
+          ROS: ${{ inputs.runner_os }}
         run: |
           set -euo pipefail
-          want=".ship/scripts/ship/deploy-native.$([ '${{ inputs.runner_os }}' = 'windows' ] && echo ps1 || echo sh)"
+          want=".ship/scripts/ship/deploy-native.$([ "$ROS" = 'windows' ] && echo ps1 || echo sh)"
           if [ ! -f "$want" ]; then
-            echo "::error::$want 不存在（pipeline_ref='${{ inputs.pipeline_ref }}'）。"
+            echo "::error::$want 不存在（pipeline_ref='$REF'）。"
             echo "::error::呼叫端 uses: …@<ref> 與 with.pipeline_ref 必須指向同一版。"
             exit 1
           fi
@@ -146,24 +168,40 @@ jobs:
       - name: 換版（Windows）
         if: inputs.runner_os == 'windows'
         shell: pwsh
+        # 全部走 env。把 ${{ }} 直接內插進 run: 會讓值裡的引號變成可執行的
+        # PowerShell——而 start_cmd / stop_cmd 這些輸入本來就是「一整段指令」，
+        # 是這類注入最容易發生的地方。POSIX 那支早就走 env，這支要對齊。
+        env:
+          ARTIFACT_FILE: ${{ inputs.artifact_file }}
+          ARTIFACT_SHA: ${{ inputs.artifact_sha }}
+          SERVICE: ${{ inputs.service_name }}
+          INSTALL_ROOT: ${{ inputs.install_root }}
+          START_CMD: ${{ inputs.start_cmd }}
+          STOP_CMD: ${{ inputs.stop_cmd }}
+          HEALTH_URL: ${{ inputs.health_url }}
+          HEALTH_CMD: ${{ inputs.health_cmd }}
+          HEALTH_TIMEOUT: ${{ inputs.health_timeout }}
+          KEEP_RELEASES: ${{ inputs.keep_releases }}
         run: |
           & .ship/scripts/ship/deploy-native.ps1 `
-            -Artifact "ship-artifact/${{ inputs.artifact_file }}" `
-            -ArtifactSha "${{ inputs.artifact_sha }}" `
-            -Service "${{ inputs.service_name }}" `
-            -InstallRoot "${{ inputs.install_root }}" `
-            -StartCmd "${{ inputs.start_cmd }}" `
-            -StopCmd "${{ inputs.stop_cmd }}" `
-            -HealthUrl "${{ inputs.health_url }}" `
-            -HealthCmd "${{ inputs.health_cmd }}" `
-            -HealthTimeout ${{ inputs.health_timeout }} `
-            -KeepReleases ${{ inputs.keep_releases }}
+            -Artifact "ship-artifact/$env:ARTIFACT_FILE" `
+            -ArtifactSha "$env:ARTIFACT_SHA" `
+            -Service "$env:SERVICE" `
+            -InstallRoot "$env:INSTALL_ROOT" `
+            -StartCmd "$env:START_CMD" `
+            -StopCmd "$env:STOP_CMD" `
+            -HealthUrl "$env:HEALTH_URL" `
+            -HealthCmd "$env:HEALTH_CMD" `
+            -HealthTimeout ([int]$env:HEALTH_TIMEOUT) `
+            -KeepReleases ([int]$env:KEEP_RELEASES)
 
       - name: 部署失敗時抓現場
         if: failure()
         shell: bash
+        env:
+          ROOT: ${{ inputs.install_root }}
         run: |
-          root='${{ inputs.install_root }}'
+          root="$ROOT"
           echo "=== current 指向 ==="; ls -la "$root/current" 2>/dev/null || true
           echo "=== releases ==="; ls -1 "$root/releases" 2>/dev/null || true
           echo "=== 狀態檔 ==="; cat "$root/.ship-state" 2>/dev/null || cat "$root/.ship-state.json" 2>/dev/null || true
@@ -179,6 +217,11 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: 開 / 更新 ship-failure issue
+        env:
+          SVC: ${{ inputs.service_name }}
+          ROOT: ${{ inputs.install_root }}
+          ASHA: ${{ inputs.artifact_sha }}
+          AUTOFIX: ${{ inputs.hand_to_autofix }}
         run: |
           set -euo pipefail
           gh label create ship-failure --color B60205 \
@@ -189,9 +232,9 @@ jobs:
           {
             echo "原生換版在 \`${GITHUB_REF_NAME}\` 上失敗。"
             echo
-            echo "- 服務：\`${{ inputs.service_name }}\`"
-            echo "- 安裝根目錄：\`${{ inputs.install_root }}\`"
-            echo "- artifact sha256：\`${{ inputs.artifact_sha }}\`"
+            echo "- 服務：\`$SVC\`"
+            echo "- 安裝根目錄：\`$ROOT\`"
+            echo "- artifact sha256：\`$ASHA\`"
             echo "- commit：\`${GITHUB_SHA}\`"
             echo "- 執行紀錄：$run_url"
             echo
@@ -205,7 +248,7 @@ jobs:
             gh issue comment "$existing" -R "$GITHUB_REPOSITORY" --body-file issue-body.md
           else
             labels="ship-failure"
-            [ "${{ inputs.hand_to_autofix }}" = "true" ] && labels="ship-failure,auto-fix"
+            [ "$AUTOFIX" = "true" ] && labels="ship-failure,auto-fix"
             gh issue create -R "$GITHUB_REPOSITORY" --title "$title" \
               --body-file issue-body.md --label "$labels"
           fi

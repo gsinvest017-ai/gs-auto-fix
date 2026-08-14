@@ -21,6 +21,10 @@ jobs:
   # 那本來就是各專案 CI 的職責，reusable workflow 不該猜。
   build:
     runs-on: ubuntu-latest
+    # 明寫最小權限。沒有這個區塊時 GITHUB_TOKEN 會拿到 repo 的預設權限，
+    # 而這個 job 只需要讀原始碼——多出來的權限只有在出事時才會被用到。
+    permissions:
+      contents: read
     outputs:
       sha: ${{ steps.pack.outputs.sha }}
     steps:
