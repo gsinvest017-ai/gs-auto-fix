@@ -49,5 +49,5 @@ jobs:
       deploy: ${{ github.event_name != 'workflow_dispatch' || inputs.deploy }}
       deploy_env: dev
       service_name: ship-selftest
-      published_port: 18099
+      published_port: 18090
       strategy: recreate

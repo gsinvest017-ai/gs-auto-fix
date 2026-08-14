@@ -16,7 +16,24 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DEPLOY="$HERE/../scripts/ship/deploy.sh"
 SVC="shiptest"
-PORT=18099
+
+# port 動態挑，不要寫死。這支會跑在自架 runner 上，而那台同時也是部署目標——
+# 寫死的話遲早撞上某個已部署服務，症狀是 deploy.sh 在「換版」那步爆
+# "port is already allocated"，然後測試報「回滾失敗」，看起來像換版邏輯壞了。
+# 實際踩過：ship-selftest 部署在 18099，正好是本檔原本寫死的號碼。
+pick_free_port() {
+  local p
+  for p in $(seq 18100 18199); do
+    if ! (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null; then
+      echo "$p"; return 0
+    fi
+    exec 3>&- 2>/dev/null || true
+  done
+  echo "18100"   # 全都被佔就退回固定值，讓錯誤訊息自己說話
+}
+PORT="$(pick_free_port)"
+echo "使用 port $PORT"
+
 WORK="$(mktemp -d)"
 export SHIP_STATE_DIR="$WORK/state"
 export SHIP_NETWORK="shiptest-net"
