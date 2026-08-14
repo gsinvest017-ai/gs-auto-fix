@@ -150,6 +150,20 @@ on:
         type: string
         default: ""
 
+      # ---------------- 流水線自身 ----------------
+      pipeline_ref:
+        description: |
+          抓輔助腳本（scripts/ship/）要用的 gs-auto-fix ref。
+          **必須與你 uses: 釘的 @ref 一致。**
+
+          為什麼要你自己填：GitHub 沒有提供「被呼叫的 reusable workflow 自己
+          的 ref」這個 context。github.job_workflow_sha 看起來像是答案但實測
+          求值為空字串，而空字串會讓 actions/checkout 靜默退回預設分支——腳本
+          抓錯版本，報表產不出來，但每個 step 都是綠的。
+        required: false
+        type: string
+        default: v1
+
       # ---------------- 失敗通報 ----------------
       hand_to_autofix:
         description: 失敗時是否順手標 auto-fix，交給自動修復流水線
@@ -258,17 +272,35 @@ jobs:
       - uses: actions/checkout@v4
 
       # 本流水線的輔助腳本住在 gs-auto-fix，不在呼叫端 repo，所以要自己拉一份。
-      #
-      # ref 用 job_workflow_sha 而不是寫死 v1：那是**本檔自己**被載入時的 commit
-      # sha。呼叫端釘 @v1 就拿 v1 的腳本、釘 @v2 就拿 v2 的，腳本與 workflow
-      # 永遠同一個 commit，不可能配錯版。寫死 tag 的話，忘記把 tag 移過來就會
-      # 讓所有 caller 在這一步靜默壞掉——而且錯的是被呼叫端，很難追。
+      # ref 由呼叫端用 pipeline_ref 明示（原因見該 input 的說明）。
       - name: 取得流水線輔助腳本
         uses: actions/checkout@v4
         with:
           repository: gsinvest017-ai/gs-auto-fix
-          ref: ${{ github.job_workflow_sha }}
+          ref: ${{ inputs.pipeline_ref }}
           path: .ship
+
+      # checkout 抓錯 ref 時**不會**失敗——它只會給你另一個版本的檔案樹。
+      # 沒有這道檢查的話，腳本不存在要等到「產生錯誤報表」那步才發現，而那步
+      # 有 fallback，於是報表變成一行「產生失敗」、測試閘門照樣放行，整條流水線
+      # 全綠。實際踩過一次，所以這裡寧可提早硬失敗。
+      - name: 確認輔助腳本到位
+        run: |
+          set -euo pipefail
+          missing=0
+          for f in scripts/ship/report.py scripts/ship/deploy.sh; do
+            if [ ! -f ".ship/$f" ]; then
+              echo "::error::.ship/$f 不存在"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::以 pipeline_ref='${{ inputs.pipeline_ref }}' 取得的 gs-auto-fix 不含流水線腳本。"
+            echo "::error::最常見原因：呼叫端 uses: …@<ref> 與 with.pipeline_ref 不一致，"
+            echo "::error::或該 tag 還沒移到含 scripts/ship/ 的 commit。兩者必須指向同一版。"
+            exit 1
+          fi
+          echo "輔助腳本已就緒（pipeline_ref=${{ inputs.pipeline_ref }}）"
 
       - uses: docker/login-action@v3
         with:
@@ -489,8 +521,17 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: gsinvest017-ai/gs-auto-fix
-          ref: ${{ github.job_workflow_sha }}
+          ref: ${{ inputs.pipeline_ref }}
           path: .ship
+
+      - name: 確認輔助腳本到位
+        run: |
+          set -euo pipefail
+          if [ ! -f .ship/scripts/ship/deploy.sh ]; then
+            echo "::error::.ship/scripts/ship/deploy.sh 不存在（pipeline_ref='${{ inputs.pipeline_ref }}'）。"
+            echo "::error::呼叫端 uses: …@<ref> 與 with.pipeline_ref 必須指向同一版。"
+            exit 1
+          fi
 
       - name: 藍綠換版
         env:
