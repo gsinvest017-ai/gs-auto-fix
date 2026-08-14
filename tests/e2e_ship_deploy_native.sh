@@ -52,7 +52,7 @@ make_artifact() {                    # make_artifact <版本字串> <healthy:yes
   local ver="$1" healthy="$2"
   local d="$WORK/src-$ver"; mkdir -p "$d"
   cat > "$d/app.py" <<PY
-import http.server, socketserver, sys
+import http.server, sys
 VER, HEALTHY = "$ver", "$healthy" == "yes"
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -62,7 +62,12 @@ class H(http.server.BaseHTTPRequestHandler):
         self.send_response(200); self.send_header("Content-Length", str(len(b)))
         self.end_headers(); self.wfile.write(b)
     def log_message(self, *a): pass
-socketserver.TCPServer(("", int(sys.argv[1])), H).serve_forever()
+# 用 HTTPServer 而不是裸的 socketserver.TCPServer：前者有設
+# allow_reuse_address(SO_REUSEADDR)，後者沒有。原生換版是「殺掉舊行程、
+# 新行程綁同一個 port」，沒有 SO_REUSEADDR 的話舊 socket 卡在 TIME_WAIT，
+# 新行程會拿到 Address already in use 而看起來像「新版不健康」。
+# 容器版不會有這個問題——每個容器有自己的 network namespace。
+http.server.HTTPServer(("", int(sys.argv[1])), H).serve_forever()
 PY
   local tgz="$WORK/$ver.tar.gz"
   tar czf "$tgz" -C "$d" .

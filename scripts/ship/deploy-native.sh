@@ -175,6 +175,15 @@ EOF
 # 原生服務通常綁固定 port，沒辦法像容器那樣先在旁邊起一份做閘門。
 # 所以順序是：停舊 → 指向新 → 起新 → 驗健康 → 不健康就把 symlink 指回去再起舊版。
 # 換版之際有數秒空窗，但不會出現「壞版本長期接管線上」。
+#
+# ⚠ 原生換版特有的坑：舊行程被殺之後，它的 listening socket 會停在 TIME_WAIT。
+#   若服務沒有設 SO_REUSEADDR，新行程綁同一個 port 會拿到
+#   「Address already in use」而失敗——**症狀看起來是「新版不健康」**，然後回滾
+#   起舊版也綁不上，最後變成「服務目前是壞的」。容器版不會有這個問題，每個容器
+#   有自己的 network namespace。
+#   對策：服務端設 SO_REUSEADDR（Python 用 http.server.HTTPServer 而不是裸的
+#   socketserver.TCPServer；後者預設 allow_reuse_address=False），或把
+#   HEALTH_TIMEOUT 拉到大於 TIME_WAIT。前者才是正解。
 stop_service
 point_current "$SHA12"
 
