@@ -52,7 +52,7 @@ jobs:
       # fail_smoke=true 時換成必定失敗的指令，用來驗 notify_failure。
       # exit 7 是刻意挑的非常見碼，在報表裡一眼認得出是刻意失敗而非真的壞了。
       # push 事件沒有 inputs，inputs.fail_smoke 為 null（falsy），自動走正常分支。
-      smoke_cmd: echo "TEMP: 刻意失敗以驗證 notify_failure"; exit 7
+      smoke_cmd: 'echo TEMP-刻意失敗以驗證-notify_failure; exit 7'
 
       # push 事件沒有 inputs，${{ inputs.deploy }} 會是空字串（= false）。
       # 寫成這樣讓 push 預設驗完整條，dispatch 則尊重使用者勾選。
