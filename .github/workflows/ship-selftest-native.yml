@@ -11,9 +11,8 @@ name: ship-selftest-native
 # 這支會在 gs-mac 上留下一個跑著的服務（那就是 deploy 的定義），
 # 位置 ~/ship-selftest-native、port 18400，確認完可自行移除。
 
+# 只手動觸發：這支每跑一次就會真的部署到 gs-mac。
 on:
-  push:
-    branches: [dev/ship-pipeline]
   workflow_dispatch:
 
 jobs:

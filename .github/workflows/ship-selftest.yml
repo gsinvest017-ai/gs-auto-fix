@@ -12,13 +12,11 @@ name: ship-selftest
 # 這支會在自架 runner 上留下一個跑著的容器（那就是 deploy 的定義），
 # 名稱 ship-selftest、port 18099，確認完可以自行移除。
 #
-# push 觸發是暫時的：workflow_dispatch 只有在**預設分支**上的 workflow 才觸發
-# 得了，而開發期間本檔還在 dev 分支。合併到 main 後應該把 push 那段拿掉，
-# 只留 workflow_dispatch——否則每次動這個分支都會真的部署一次。
+# 只手動觸發。開發期間曾加過 push 觸發（因為 workflow_dispatch 只有在預設分支
+# 上的 workflow 才叫得動），合併進 main 後已移除——這支每跑一次就會真的部署，
+# 不該綁在 push 上。
 
 on:
-  push:
-    branches: [dev/ship-pipeline]
   workflow_dispatch:
     inputs:
       deploy:
