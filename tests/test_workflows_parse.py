@@ -57,7 +57,10 @@ def test_呼叫_reusable_ship_時_pipeline_ref_要與_uses_的_ref_一致(path: 
     doc = yaml.safe_load(path.read_text(encoding="utf-8"))
     for job_name, job in (doc.get("jobs") or {}).items():
         uses = (job or {}).get("uses", "")
-        if "_reusable-ship.yml@" not in uses:
+        # 容器版與原生版都要檢查。用 startswith 判斷檔名而不是子字串比對——
+        # "_reusable-ship.yml@" 這個子字串抓不到 "_reusable-ship-native.yml@"。
+        if not any(f"{name}@" in uses for name in
+                   ("_reusable-ship.yml", "_reusable-ship-native.yml")):
             continue
         ref = uses.split("@", 1)[1]
         declared = ((job.get("with") or {}).get("pipeline_ref") or "")

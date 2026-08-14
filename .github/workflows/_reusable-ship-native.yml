@@ -1,0 +1,211 @@
+name: Reusable ship pipeline (native)
+
+# 原生（非容器）換版流水線 —— 給 gs-shipyard 分級中的 native-win / native-mac。
+#
+# 為什麼不塞進 _reusable-ship.yml：
+#   那支的 build 是 docker build、test 是在沙盒容器裡跑。原生專案兩者都不適用
+#   （build 出來的是安裝檔或壓縮包、測試在宿主上跑）。硬合成一支只會變成滿是
+#   `if: inputs.mode == ...` 的條件式泥沼，兩條路徑都更難讀也更難驗。
+#
+#   所以分工是：**build 與 test 由呼叫端自己做**（那本來就是各專案的 CI），
+#   本流水線只負責最後那段「換版要安全」。
+#
+# 不變量與容器版一致：
+#   * 被測的 artifact 就是被部署的 artifact —— 容器用 image digest，這裡用
+#     artifact 的 sha256。呼叫端算一次、部署前再算一次，對不上就中止。
+#   * 上一版在新版健康之前絕不刪除 —— 回滾靠的就是它。
+#   * 任何失敗路徑都以「線上仍有一個健康版本」收尾。
+
+on:
+  workflow_call:
+    inputs:
+      pipeline_ref:
+        description: |
+          抓輔助腳本要用的 gs-auto-fix ref，**必須與你 uses: 釘的 @ref 一致**。
+          原因同 _reusable-ship.yml：GitHub 沒有提供「被呼叫的 reusable
+          workflow 自己的 ref」這個 context。
+        required: false
+        type: string
+        default: v1
+
+      artifact_name:
+        description: 呼叫端 build job 上傳的 Actions artifact 名稱
+        required: true
+        type: string
+      artifact_file:
+        description: artifact 內要部署的檔名（.zip 或 .tar.gz）
+        required: true
+        type: string
+      artifact_sha:
+        description: |
+          該檔的 sha256（呼叫端在 build 階段算好並傳進來）。
+          這就是「測的就是部的」那條不變量的載體——留空等於放棄它。
+        required: true
+        type: string
+
+      deploy_runner:
+        description: |
+          部署 runner 的 labels，JSON 陣列字串。
+          原生部署的 runner **就是目標主機本身**，所以這裡選錯機器＝部署到錯的
+          地方，比容器版更不能寫得鬆。
+        required: true
+        type: string
+      runner_os:
+        description: windows | posix（決定跑 deploy-native.ps1 還是 .sh）
+        required: true
+        type: string
+
+      service_name:
+        required: true
+        type: string
+      install_root:
+        description: 安裝根目錄（releases/ 與 current 會建在這底下）
+        required: true
+        type: string
+      start_cmd:
+        description: 啟動指令，在 current/ 內執行
+        required: true
+        type: string
+      stop_cmd:
+        description: 停止指令；留空 = 不停（適用單次執行型）
+        required: false
+        type: string
+        default: ""
+      health_url:
+        required: false
+        type: string
+        default: ""
+      health_cmd:
+        description: 健康檢查指令，在 current/ 內執行（非零 = 不健康）
+        required: false
+        type: string
+        default: ""
+      health_timeout:
+        required: false
+        type: number
+        default: 60
+      keep_releases:
+        description: 保留幾個舊 release（下限硬性為 2——上一版是回滾唯一依據）
+        required: false
+        type: number
+        default: 3
+
+      hand_to_autofix:
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  deploy_native:
+    runs-on: ${{ fromJSON(inputs.deploy_runner) }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: ship-artifact
+
+      - name: 取得流水線輔助腳本
+        uses: actions/checkout@v4
+        with:
+          repository: gsinvest017-ai/gs-auto-fix
+          ref: ${{ inputs.pipeline_ref }}
+          path: .ship
+
+      # checkout 抓錯 ref 不會失敗，只會給你另一個版本的檔案樹。沒有這道守門，
+      # 腳本不存在要等到執行那步才發現，而那時錯誤訊息指不回真正的原因。
+      - name: 確認輔助腳本到位
+        shell: bash
+        run: |
+          set -euo pipefail
+          want=".ship/scripts/ship/deploy-native.$([ '${{ inputs.runner_os }}' = 'windows' ] && echo ps1 || echo sh)"
+          if [ ! -f "$want" ]; then
+            echo "::error::$want 不存在（pipeline_ref='${{ inputs.pipeline_ref }}'）。"
+            echo "::error::呼叫端 uses: …@<ref> 與 with.pipeline_ref 必須指向同一版。"
+            exit 1
+          fi
+          echo "輔助腳本已就緒：$want"
+
+      - name: 換版（POSIX）
+        if: inputs.runner_os != 'windows'
+        shell: bash
+        env:
+          ARTIFACT: ship-artifact/${{ inputs.artifact_file }}
+          ARTIFACT_SHA: ${{ inputs.artifact_sha }}
+          SERVICE: ${{ inputs.service_name }}
+          INSTALL_ROOT: ${{ inputs.install_root }}
+          START_CMD: ${{ inputs.start_cmd }}
+          STOP_CMD: ${{ inputs.stop_cmd }}
+          HEALTH_URL: ${{ inputs.health_url }}
+          HEALTH_CMD: ${{ inputs.health_cmd }}
+          HEALTH_TIMEOUT: ${{ inputs.health_timeout }}
+          KEEP_RELEASES: ${{ inputs.keep_releases }}
+        run: bash .ship/scripts/ship/deploy-native.sh
+
+      - name: 換版（Windows）
+        if: inputs.runner_os == 'windows'
+        shell: pwsh
+        run: |
+          & .ship/scripts/ship/deploy-native.ps1 `
+            -Artifact "ship-artifact/${{ inputs.artifact_file }}" `
+            -ArtifactSha "${{ inputs.artifact_sha }}" `
+            -Service "${{ inputs.service_name }}" `
+            -InstallRoot "${{ inputs.install_root }}" `
+            -StartCmd "${{ inputs.start_cmd }}" `
+            -StopCmd "${{ inputs.stop_cmd }}" `
+            -HealthUrl "${{ inputs.health_url }}" `
+            -HealthCmd "${{ inputs.health_cmd }}" `
+            -HealthTimeout ${{ inputs.health_timeout }} `
+            -KeepReleases ${{ inputs.keep_releases }}
+
+      - name: 部署失敗時抓現場
+        if: failure()
+        shell: bash
+        run: |
+          root='${{ inputs.install_root }}'
+          echo "=== current 指向 ==="; ls -la "$root/current" 2>/dev/null || true
+          echo "=== releases ==="; ls -1 "$root/releases" 2>/dev/null || true
+          echo "=== 狀態檔 ==="; cat "$root/.ship-state" 2>/dev/null || cat "$root/.ship-state.json" 2>/dev/null || true
+
+  notify_failure:
+    needs: [deploy_native]
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: 開 / 更新 ship-failure issue
+        run: |
+          set -euo pipefail
+          gh label create ship-failure --color B60205 \
+            --description "打版流水線測試失敗" -R "$GITHUB_REPOSITORY" 2>/dev/null || true
+
+          title="原生換版失敗：${GITHUB_REF_NAME} @ ${GITHUB_SHA:0:7}"
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          {
+            echo "原生換版在 \`${GITHUB_REF_NAME}\` 上失敗。"
+            echo
+            echo "- 服務：\`${{ inputs.service_name }}\`"
+            echo "- 安裝根目錄：\`${{ inputs.install_root }}\`"
+            echo "- artifact sha256：\`${{ inputs.artifact_sha }}\`"
+            echo "- commit：\`${GITHUB_SHA}\`"
+            echo "- 執行紀錄：$run_url"
+            echo
+            echo "> deploy-native 的失敗路徑一律以「線上仍有一個健康版本」收尾。"
+            echo "> 若訊息是「回滾也未通過健康檢查」，那才是真的需要人工介入。"
+          } > issue-body.md
+
+          existing=$(gh issue list -R "$GITHUB_REPOSITORY" --label ship-failure --state open \
+            --search "${GITHUB_SHA:0:7} in:title" --json number --jq '.[0].number' 2>/dev/null || true)
+          if [ -n "$existing" ] && [ "$existing" != "null" ]; then
+            gh issue comment "$existing" -R "$GITHUB_REPOSITORY" --body-file issue-body.md
+          else
+            labels="ship-failure"
+            [ "${{ inputs.hand_to_autofix }}" = "true" ] && labels="ship-failure,auto-fix"
+            gh issue create -R "$GITHUB_REPOSITORY" --title "$title" \
+              --body-file issue-body.md --label "$labels"
+          fi
