@@ -126,6 +126,36 @@ PREV_IMAGE=$2
 EOF
 }
 
+# 每次部署都 pull 一個新 digest，舊的沒人清就單調成長，最後把自架 runner 的
+# 磁碟吃光——那不是「部署失敗」而是「runner 整台下線」，症狀跟本流水線完全
+# 無關，很難聯想回來。
+#
+# 保留規則就是回滾契約：現行版 + 上一版。再舊的沒有任何用途。
+# docker rmi 對「正在被容器使用」的 image 會失敗，所以就算保留清單算錯，
+# 也不會把線上服務的 image 刪掉——那是這裡最後一道保險，故一律吞錯。
+prune_old_images() {                # prune_old_images <keep_current> <keep_prev>
+  local keep_cur="$1" keep_prev="${2:-}"
+  local repo="${keep_cur%%@*}"; repo="${repo%%:*}"
+  [ -n "$repo" ] || return 0
+
+  local line id dig ref removed=0
+  while read -r line; do
+    [ -n "$line" ] || continue
+    id="${line%% *}"; dig="${line##* }"
+    [ "$dig" = "<none>" ] && continue
+    ref="${repo}@${dig}"
+    [ "$ref" = "$keep_cur" ] && continue
+    [ -n "$keep_prev" ] && [ "$ref" = "$keep_prev" ] && continue
+    if docker rmi "$id" >/dev/null 2>&1; then
+      removed=$((removed+1))
+    fi
+  done <<< "$(docker image ls --no-trunc --filter "reference=${repo}" \
+                --format '{{.ID}} {{.Digest}}' 2>/dev/null || true)"
+
+  [ "$removed" -gt 0 ] && log "清掉 $removed 個不再需要的舊 image（保留現行版與上一版）"
+  return 0
+}
+
 # ---------------------------------------------------------------- proxy
 if [ "$STRATEGY" = "proxy" ]; then
   [ -n "$CADDY_ADMIN" ] || die "strategy=proxy 需要 caddy_admin"
@@ -160,7 +190,10 @@ if [ "$STRATEGY" = "proxy" ]; then
     docker stop "$OLD_C" >/dev/null 2>&1 || true
     log "舊色 $OLD_C 已停（保留容器，供人工回滾）"
   fi
+  # 注意順序：先 save_state 落地回滾點，再清舊 image。反過來的話，清到一半
+  # 掛掉就會留下「狀態檔還指著已被刪除的 PREV_IMAGE」——回滾路徑會爛掉。
   save_state "$NEW" "$IMAGE"
+  prune_old_images "$IMAGE" "$PREV_IMAGE"
   log "零停機換版完成：$SERVICE -> $NEW ($IMAGE)"
   exit 0
 fi
@@ -187,6 +220,7 @@ if start_container "$NEW_C" "$IMAGE" "${PUBLISHED_PORT}:${CONTAINER_PORT}" \
    && wait_healthy "$NEW_C" "$CONTAINER_PORT"; then
   if [ -n "$ACTIVE" ]; then docker rm -f "$OLD_C" >/dev/null 2>&1 || true; fi
   save_state "$NEW" "$IMAGE"
+  prune_old_images "$IMAGE" "$PREV_IMAGE"
   log "換版完成：$SERVICE -> $NEW ($IMAGE)"
   exit 0
 fi
