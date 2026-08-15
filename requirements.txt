@@ -1,4 +1,4 @@
 pytest>=8.0
 # tests/test_pr_review_workflow.py 直接讀 workflow YAML 把 shell 抽出來執行，
 # 避免「測試複製一份腳本」與 YAML 內容漂移。
-PyYAML>=6.0
+PyYAML>=6.0.3
