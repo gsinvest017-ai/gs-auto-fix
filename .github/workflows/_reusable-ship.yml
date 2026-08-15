@@ -497,7 +497,7 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       AUTOFIX: ${{ inputs.hand_to_autofix }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: ship-report-${{ github.sha }}
           path: ship-report
